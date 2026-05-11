@@ -95,19 +95,7 @@ async function main(): Promise<void> {
   });
   _setZaloApi = setZaloApi;
 
-  // ── Register bot commands for Telegram menu ───────────────────────────────
-  tgBot.telegram.setMyCommands([
-    { command: 'login',          description: 'Đăng nhập Zalo qua QR code' },
-    { command: 'search',         description: 'Tìm bạn bè / nhóm Zalo để tạo topic' },
-    { command: 'addfriend',      description: 'Tìm & kết bạn Zalo theo số điện thoại' },
-    { command: 'addgroup',       description: 'Tạo topic cho nhóm Zalo chưa có topic' },
-    { command: 'joingroup',      description: 'Tham gia nhóm Zalo qua link' },
-    { command: 'leavegroup',     description: 'Rời nhóm Zalo & đóng topic (dùng trong topic nhóm)' },
-    { command: 'friendrequests', description: 'Xem lời mời kết bạn & lời mời nhóm' },
-    { command: 'topic',          description: 'Quản lý topic: list / info / delete' },
-    { command: 'recall',         description: 'Thu hồi tin nhắn (reply vào tin đã gửi)' },
-    { command: 'status',         description: 'Xem trạng thái bridge: uptime, số topic, Zalo' },
-  ]).catch(() => undefined);
+  // ── Telegram command menu is synced from telegram/bot.ts to avoid drift ──
 
   // ── Start Telegram bot so /login can be received immediately ───────────────
   // NOTE: tgBot.launch() runs the polling loop forever, so we must NOT await it.

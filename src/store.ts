@@ -141,6 +141,13 @@ interface MsgMapData {
   quotes: [number, ZaloQuoteData][];
 }
 
+export interface MsgSearchHit {
+  tgMsgId: number;
+  quote:   ZaloQuoteData;
+  text:    string;
+  snippet: string;
+}
+
 const _msgMapFile = path.resolve(config.dataDir, 'msg-map.json');
 
 function _loadMsgMap(): MsgMapData {
@@ -227,6 +234,80 @@ function _scheduleMsgPersist(): void {
   }, 1000);
 }
 
+function normalizeMessageSearchValue(value: string): string {
+  return value.toLowerCase().normalize('NFD').replace(/\p{Mn}/gu, '').replace(/\s+/g, ' ').trim();
+}
+
+function buildMessageSearchSnippet(value: string, limit = 120): string {
+  const compact = value.replace(/\s+/g, ' ').trim();
+  return compact.length > limit ? `${compact.slice(0, limit - 1)}…` : compact;
+}
+
+function collectSearchableStrings(
+  value: unknown,
+  sink: string[],
+  key?: string,
+  depth = 0,
+): void {
+  if (depth > 5 || value == null) return;
+
+  if (typeof value === 'string') {
+    const trimmed = value.replace(/\s+/g, ' ').trim();
+    if (!trimmed) return;
+
+    if ((trimmed.startsWith('{') && trimmed.endsWith('}')) || (trimmed.startsWith('[') && trimmed.endsWith(']'))) {
+      try {
+        collectSearchableStrings(JSON.parse(trimmed) as unknown, sink, key, depth + 1);
+        return;
+      } catch {
+        // fall through to treat it as plain text
+      }
+    }
+
+    if (/^https?:\/\//i.test(trimmed)) return;
+
+    if (!key) {
+      sink.push(trimmed);
+      return;
+    }
+
+    const lowerKey = key.toLowerCase();
+    if (['href', 'hd', 'thumb', 'avatar', 'url', 'file', 'src', 'id', 'climsgid', 'msgid', 'uid', 'ts', 'ttl', 'params'].includes(lowerKey)) {
+      return;
+    }
+
+    if (
+      ['text', 'content', 'title', 'description', 'desc', 'caption', 'name', 'body', 'message', 'msg'].includes(lowerKey)
+      || false
+    ) {
+      sink.push(trimmed);
+      return;
+    }
+
+    if (lowerKey.endsWith('text') || lowerKey.endsWith('title') || lowerKey.endsWith('name') || lowerKey.endsWith('desc') || lowerKey.endsWith('caption')) {
+      sink.push(trimmed);
+    }
+    return;
+  }
+
+  if (Array.isArray(value)) {
+    for (const item of value) collectSearchableStrings(item, sink, key, depth + 1);
+    return;
+  }
+
+  if (typeof value === 'object') {
+    for (const [childKey, childValue] of Object.entries(value as Record<string, unknown>)) {
+      collectSearchableStrings(childValue, sink, childKey, depth + 1);
+    }
+  }
+}
+
+function extractQuoteSearchText(content: ZaloQuoteData['content']): string {
+  const values: string[] = [];
+  collectSearchableStrings(content, values);
+  return [...new Set(values)].join(' • ');
+}
+
 // ── In-memory state (pre-loaded from disk) ────────────────────────────────────
 
 /** zaloMsgId → Telegram message_id (used to find TG reply target) */
@@ -290,6 +371,36 @@ export const msgStore = {
   /** Get the Zalo quote data for a given Telegram message_id (for TG→Zalo replies). */
   getQuote(tgMsgId: number): ZaloQuoteData | undefined {
     return _tgToQuote.get(tgMsgId);
+  },
+
+  /** Search recent bridged messages by textual content stored in quote payloads. */
+  searchByContent(query: string, limit = 10): MsgSearchHit[] {
+    const normalizedQuery = normalizeMessageSearchValue(query);
+    if (!normalizedQuery) return [];
+
+    const hits: MsgSearchHit[] = [];
+    for (const [tgMsgId, quote] of [..._tgToQuote.entries()].reverse()) {
+      const text = extractQuoteSearchText(quote.content);
+      if (!text) continue;
+      if (!normalizeMessageSearchValue(text).includes(normalizedQuery)) continue;
+      hits.push({
+        tgMsgId,
+        quote,
+        text,
+        snippet: buildMessageSearchSnippet(text),
+      });
+      if (hits.length >= limit) break;
+    }
+    return hits;
+  },
+
+  /** Count how many cached messages currently have searchable text. */
+  getSearchableCount(): number {
+    let count = 0;
+    for (const quote of _tgToQuote.values()) {
+      if (extractQuoteSearchText(quote.content)) count += 1;
+    }
+    return count;
   },
 };
 

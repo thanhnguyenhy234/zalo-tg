@@ -122,6 +122,17 @@ function buildTopicUrl(topicId: number): string {
   return `https://t.me/c/${internalChatId}/${topicId}`;
 }
 
+function buildMessageUrl(messageId: number): string {
+  const chatId = String(config.telegram.groupId);
+  const internalChatId = chatId.startsWith('-100') ? chatId.slice(4) : chatId.replace(/^-/, '');
+  return `https://t.me/c/${internalChatId}/${messageId}`;
+}
+
+function truncateSearchLabel(value: string, limit = 48): string {
+  const compact = value.replace(/\s+/g, ' ').trim();
+  return compact.length > limit ? `${compact.slice(0, limit - 1)}…` : compact;
+}
+
 type ZaloAliasListResponse = {
   items?: Array<{ userId?: string; alias?: string }>;
 };
@@ -526,6 +537,63 @@ export function setupTelegramHandler(
       config.telegram.groupId,
       parts.join('\n'),
       { ...replyOpts, parse_mode: 'HTML', reply_markup: { inline_keyboard: buttons } },
+    );
+  });
+
+  tgBot.command('searchmsg', async (ctx) => {
+    if (ctx.chat.id !== config.telegram.groupId) return;
+    const threadId = 'message_thread_id' in ctx.message
+      ? (ctx.message.message_thread_id as number | undefined)
+      : undefined;
+    const replyOpts = threadId ? { message_thread_id: threadId } : {};
+
+    const query = (ctx.message.text ?? '').replace(/^\/searchmsg(?:@[A-Za-z0-9_]+)?\s*/i, '').trim();
+    if (!query) {
+      await ctx.telegram.sendMessage(
+        config.telegram.groupId,
+        '🔎 Cú pháp: /searchmsg <từ khóa>\nTìm trong các tin nhắn Zalo đã được sync gần đây qua bridge (dựa trên cache cục bộ hiện có, không phải toàn bộ lịch sử cloud).',
+        replyOpts,
+      );
+      return;
+    }
+
+    const searchableCount = msgStore.getSearchableCount();
+    const hits = msgStore.searchByContent(query, 8);
+    if (hits.length === 0) {
+      await ctx.telegram.sendMessage(
+        config.telegram.groupId,
+        `🔎 Không tìm thấy nội dung phù hợp với: ${query}\n(Hiện chỉ tìm trong ${searchableCount} tin nhắn đã sync còn nằm trong cache gần đây.)`,
+        replyOpts,
+      );
+      return;
+    }
+
+    const lines = [
+      `🔎 Kết quả nội dung cho: ${query}`,
+      `Tìm trong ${searchableCount} tin nhắn đã sync gần đây.`,
+      '',
+    ];
+    const buttons: Array<Array<{ text: string; url: string }>> = [];
+
+    hits.forEach((hit, index) => {
+      const topicId = store.getTopicByZalo(hit.quote.zaloId, hit.quote.threadType);
+      const entry = topicId !== undefined ? store.getEntryByTopic(topicId) : undefined;
+      const sourceName = entry?.name ?? (hit.quote.threadType === 1 ? `Nhóm ${hit.quote.zaloId}` : `Chat ${hit.quote.zaloId}`);
+      lines.push(`${index + 1}. ${sourceName}`);
+      lines.push(`   ${hit.snippet}`);
+      lines.push('');
+      buttons.push([{ text: `${index + 1}. ${truncateSearchLabel(sourceName)}`, url: buildMessageUrl(hit.tgMsgId) }]);
+    });
+
+    lines.push('↗ Nhấn nút để mở đúng tin nhắn trong Telegram.');
+
+    await ctx.telegram.sendMessage(
+      config.telegram.groupId,
+      lines.join('\n'),
+      {
+        ...replyOpts,
+        reply_markup: { inline_keyboard: buttons },
+      },
     );
   });
 

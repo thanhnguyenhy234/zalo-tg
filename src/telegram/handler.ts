@@ -540,18 +540,18 @@ export function setupTelegramHandler(
     );
   });
 
-  tgBot.command('searchmsg', async (ctx) => {
+  tgBot.command('message_search', async (ctx) => {
     if (ctx.chat.id !== config.telegram.groupId) return;
     const threadId = 'message_thread_id' in ctx.message
       ? (ctx.message.message_thread_id as number | undefined)
       : undefined;
     const replyOpts = threadId ? { message_thread_id: threadId } : {};
 
-    const query = (ctx.message.text ?? '').replace(/^\/searchmsg(?:@[A-Za-z0-9_]+)?\s*/i, '').trim();
+    const query = (ctx.message.text ?? '').replace(/^\/message_search(?:@[A-Za-z0-9_]+)?\s*/i, '').trim();
     if (!query) {
       await ctx.telegram.sendMessage(
         config.telegram.groupId,
-        '🔎 Cú pháp: /searchmsg <từ khóa>\nTìm trong các tin nhắn Zalo đã được sync gần đây qua bridge (dựa trên cache cục bộ hiện có, không phải toàn bộ lịch sử cloud).',
+        '🔎 Cú pháp: /message_search <từ khóa>\nTìm trong các tin nhắn Zalo đã được sync gần đây qua bridge (dựa trên cache cục bộ hiện có, không phải toàn bộ lịch sử cloud).',
         replyOpts,
       );
       return;

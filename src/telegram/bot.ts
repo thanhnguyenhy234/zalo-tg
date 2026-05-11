@@ -30,4 +30,10 @@ export const tgBot = new Telegraf(config.telegram.token, {
 
 export async function syncTelegramCommands(): Promise<void> {
   await tgBot.telegram.setMyCommands(BOT_COMMANDS);
+  await tgBot.telegram.setMyCommands(BOT_COMMANDS, {
+    scope: {
+      type: 'chat',
+      chat_id: config.telegram.groupId,
+    },
+  });
 }

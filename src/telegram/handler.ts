@@ -184,6 +184,57 @@ async function refreshFriendsCache(api: ZaloAPI): Promise<void> {
   }
 }
 
+type OpenPhoneSearchUser = {
+  uid?: string;
+  display_name?: string;
+  zalo_name?: string;
+};
+
+type EnsuredDmTopic = {
+  topicId: number;
+  url: string;
+  status: 'existing' | 'created';
+  userId: string;
+  displayName: string;
+};
+
+async function ensureDmTopicForUser(user: OpenPhoneSearchUser): Promise<EnsuredDmTopic> {
+  if (!user.uid) throw new Error('Thiếu uid từ findUser');
+
+  const cachedFriend = friendsCache.getByUserId(user.uid);
+  const displayName = cachedFriend
+    ? formatFriendSearchLabel(cachedFriend)
+    : aliasCache.label(user.uid, user.display_name || user.zalo_name || `Zalo ${user.uid}`);
+
+  const existingTopicId = store.getTopicByZalo(user.uid, 0);
+  if (existingTopicId !== undefined) {
+    return {
+      topicId: existingTopicId,
+      url: buildTopicUrl(existingTopicId),
+      status: 'existing',
+      userId: user.uid,
+      displayName,
+    };
+  }
+
+  const topic = await tgBot.telegram.createForumTopic(
+    config.telegram.groupId,
+    `👤 ${displayName}`.slice(0, 128),
+    { icon_color: 0xFF93B2 },
+  );
+  const topicId = topic.message_thread_id;
+  store.set({ topicId, zaloId: user.uid, type: 0, name: displayName });
+  console.log(`[open_phone] Created DM topic "${displayName}" (topicId=${topicId})`);
+
+  return {
+    topicId,
+    url: buildTopicUrl(topicId),
+    status: 'created',
+    userId: user.uid,
+    displayName,
+  };
+}
+
 /** Track in-progress QR login so we don't stack multiple flows. */
 let qrLoginInProgress = false;
 
@@ -538,6 +589,105 @@ export function setupTelegramHandler(
       parts.join('\n'),
       { ...replyOpts, parse_mode: 'HTML', reply_markup: { inline_keyboard: buttons } },
     );
+  });
+
+  tgBot.command('open_phone', async (ctx) => {
+    const isPrivate = ctx.chat.type === 'private';
+    const isFromGroup = ctx.chat.id === config.telegram.groupId;
+    if (!isPrivate && !isFromGroup) return;
+
+    const threadId = isFromGroup && 'message_thread_id' in ctx.message
+      ? (ctx.message.message_thread_id as number | undefined)
+      : undefined;
+    const replyOpts = threadId ? { message_thread_id: threadId } : {};
+
+    if (!currentApi) {
+      await ctx.telegram.sendMessage(ctx.chat.id, '❌ Zalo chưa kết nối', replyOpts);
+      return;
+    }
+
+    const text = ctx.message && 'text' in ctx.message ? ctx.message.text ?? '' : '';
+    const [headerLine = '', ...bodyLines] = text.split(/\r?\n/);
+    const parts = headerLine.trim().split(/\s+/).filter(Boolean);
+    const phoneQuery = normalizePhoneSearchQuery(parts[1] ?? '');
+    const requestId = parts[2]?.trim();
+    const payloadMessage = bodyLines.join('\n').trim();
+
+    if (!phoneQuery) {
+      await ctx.telegram.sendMessage(
+        ctx.chat.id,
+        '⚠️ Dùng: <code>/open_phone &lt;số điện thoại&gt; [request_id]</code>\nVí dụ: <code>/open_phone 0912345678 req123</code>',
+        { ...replyOpts, parse_mode: 'HTML' },
+      );
+      return;
+    }
+
+    if (!friendsCache.isFresh()) {
+      try {
+        await refreshFriendsCache(currentApi);
+      } catch (err) {
+        console.error('[/open_phone] refreshFriendsCache failed:', err);
+      }
+    }
+
+    try {
+      const user = await currentApi.findUser(phoneQuery) as OpenPhoneSearchUser | undefined;
+      if (!user?.uid) {
+        const lines = [
+          `❌ Không tìm thấy tài khoản Zalo cho số <code>${phoneQuery}</code>.`,
+        ];
+        if (requestId) lines.push(`<code>REQUEST_ID=${escapeHtml(requestId)}</code>`);
+        await ctx.telegram.sendMessage(
+          ctx.chat.id,
+          lines.join('\n'),
+          { ...replyOpts, parse_mode: 'HTML' },
+        );
+        return;
+      }
+
+      const topic = await ensureDmTopicForUser(user);
+      if (payloadMessage) {
+        await ctx.telegram.sendMessage(
+          config.telegram.groupId,
+          payloadMessage,
+          { message_thread_id: topic.topicId },
+        );
+      }
+
+      const metaLines = [
+        requestId ? `<code>REQUEST_ID=${escapeHtml(requestId)}</code>` : '',
+        `<code>TOPIC_STATUS=${topic.status}</code>`,
+        `<code>TOPIC_ID=${topic.topicId}</code>`,
+        `<code>TOPIC_URL=${escapeHtml(topic.url)}</code>`,
+        `<code>ZALO_UID=${escapeHtml(topic.userId)}</code>`,
+        payloadMessage ? '<code>PAYLOAD_SENT=1</code>' : '',
+      ].filter(Boolean);
+
+      await ctx.telegram.sendMessage(
+        ctx.chat.id,
+        [
+          `✅ Topic sẵn sàng cho <b>${escapeHtml(topic.displayName)}</b>.`,
+          `📱 <code>${phoneQuery}</code>`,
+          '',
+          ...metaLines,
+        ].join('\n'),
+        {
+          ...replyOpts,
+          parse_mode: 'HTML',
+        },
+      );
+    } catch (err) {
+      console.error('[/open_phone]', err);
+      const lines = [
+        `❌ Lỗi mở topic cho số <code>${phoneQuery}</code>: ${escapeHtml(err instanceof Error ? err.message : String(err))}`,
+      ];
+      if (requestId) lines.push(`<code>REQUEST_ID=${escapeHtml(requestId)}</code>`);
+      await ctx.telegram.sendMessage(
+        ctx.chat.id,
+        lines.join('\n'),
+        { ...replyOpts, parse_mode: 'HTML' },
+      );
+    }
   });
 
   tgBot.command('message_search', async (ctx) => {

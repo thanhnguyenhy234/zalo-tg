@@ -1645,6 +1645,35 @@ export function setupTelegramHandler(
       return;
     }
 
+    // ── gm: approve / reject group join request ──────────────────────────────
+    if (data?.startsWith('gm:')) {
+      const parts = data.split(':'); // gm:<action>:<groupId>:<uid>
+      const action  = parts[1]; // 'approve' or 'reject'
+      const groupId = parts[2];
+      const uid     = parts[3];
+      if (!uid || !groupId || !currentApi) { await ctx.answerCbQuery('❌ Zalo chưa kết nối'); return; }
+      try {
+        await currentApi.reviewPendingMemberRequest(
+          { members: [uid], isApprove: action === 'approve' },
+          groupId,
+        );
+        const label = action === 'approve' ? '✅ Đã duyệt' : '❌ Đã từ chối';
+        await ctx.answerCbQuery(label);
+        await ctx.editMessageReplyMarkup(undefined);
+        const prevText = ctx.callbackQuery.message && 'text' in ctx.callbackQuery.message
+          ? ctx.callbackQuery.message.text ?? ''
+          : '';
+        await ctx.editMessageText(
+          prevText + `\n\n${label}`,
+          { parse_mode: 'HTML' },
+        ).catch(() => undefined);
+      } catch (err) {
+        console.error('[cb/gm]', err);
+        await ctx.answerCbQuery('❌ Thao tác thất bại');
+      }
+      return;
+    }
+
     // ── jgi: join group from invite box ─────────────────────────────────────
     if (data?.startsWith('jgi:')) {
       const groupId = data.slice(4);

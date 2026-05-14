@@ -1578,6 +1578,69 @@ ${escapeHtml(photoCaption)}`
       const groupId = String(event?.threadId ?? data?.groupId ?? '');
       if (!groupId) return;
 
+      // ── Join request: someone wants to join the group ─────────────────────
+      if (type === 'join_request') {
+        const uids: string[] = data?.uids ?? [];
+        if (!uids.length) return;
+
+        // Check admin status — must call web API (adminIds not in AppGroupData)
+        let adminIds: string[] = [];
+        let creatorId = '';
+        try {
+          const fullInfo = await api.getGroupInfo(groupId) as {
+            gridInfoMap?: Record<string, { adminIds?: string[]; creatorId?: string }>;
+          };
+          const gInfo = fullInfo?.gridInfoMap?.[groupId];
+          adminIds = gInfo?.adminIds ?? [];
+          creatorId = gInfo?.creatorId ?? '';
+        } catch { /* ignore */ }
+
+        const ownUid = String(api.getOwnId?.() ?? '');
+        const isAdmin = ownUid && (adminIds.includes(ownUid) || creatorId === ownUid);
+        if (!isAdmin) {
+          console.log(`[ZaloHandler] join_request group=${groupId}: bot is not admin, skip`);
+          return;
+        }
+
+        const topicId = store.getTopicByZalo(groupId, 1 /* Group */);
+        if (topicId === undefined) return;
+
+        const totalPending: number = data?.totalPending ?? uids.length;
+
+        for (const uid of uids) {
+          let displayName = uid;
+          try {
+            const resp = await api.getUserInfo(uid) as {
+              changed_profiles?:   Record<string, { displayName?: string; zaloName?: string }>;
+              unchanged_profiles?: Record<string, { displayName?: string; zaloName?: string }>;
+            };
+            const uidKey = uid.includes('_') ? uid : `${uid}_0`;
+            const profile =
+              resp?.changed_profiles?.[uidKey]   ?? resp?.changed_profiles?.[uid]   ??
+              resp?.unchanged_profiles?.[uidKey] ?? resp?.unchanged_profiles?.[uid];
+            displayName = profile?.displayName?.trim() || profile?.zaloName?.trim() || uid;
+          } catch { /* ignore */ }
+
+          const text = `🔔 <b>${escapeHtml(displayName)}</b> (<code>${uid}</code>) muốn tham gia nhóm.\n\nTổng đang chờ duyệt: ${totalPending}`;
+          await tg.sendMessage(
+            config.telegram.groupId,
+            text,
+            {
+              message_thread_id: topicId,
+              parse_mode: 'HTML',
+              reply_markup: {
+                inline_keyboard: [[
+                  { text: '✅ Duyệt', callback_data: `gm:approve:${groupId}:${uid}` },
+                  { text: '❌ Từ chối', callback_data: `gm:reject:${groupId}:${uid}` },
+                ]],
+              },
+            },
+          );
+        }
+        console.log(`[ZaloHandler] join_request group=${groupId} uids=${uids.join(',')} (admin=${ownUid})`);
+        return;
+      }
+
       // ── Poll vote: UPDATE_BOARD with BoardType.Poll ────────────────────────
       if (type === 'update_board' || type === 'remove_board') {
         // groupTopic.params is a JSON string containing poll info

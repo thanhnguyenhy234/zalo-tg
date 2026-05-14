@@ -1330,6 +1330,86 @@ ${escapeHtml(photoCaption)}`
         return;
       }
 
+      // ── 14. Admin xoá tin nhắn (chat.delete) ──────────────────────────────
+      if (msgType === 'chat.delete') {
+        // content là mảng JSON: [{type,actionType,uidFrom,uidTo,clientDelMsgId,globalDelMsgId,destId}]
+        let deletedItems: Array<{
+          uidFrom?: string;
+          clientDelMsgId?: string | number;
+          globalDelMsgId?: string | number;
+          destId?: string | number;
+        }> = [];
+        try {
+          const raw = msg.data.content;
+          if (typeof raw === 'string') {
+            deletedItems = JSON.parse(raw) as typeof deletedItems;
+          } else if (Array.isArray(raw)) {
+            deletedItems = raw as typeof deletedItems;
+          }
+        } catch { /* ignore parse error */ }
+
+        if (deletedItems.length === 0) return;
+
+        // Resolve tên admin đã xoá (uidFrom của event, không phải của tin bị xoá)
+        const delActorUid = msg.data.uidFrom;
+        const delActorName = await resolveUserDisplayName(api, delActorUid, 'Admin');
+
+        for (const item of deletedItems) {
+          // Zalo gửi các ID của tin bị xoá trong 3 trường:
+          //   globalDelMsgId = server msgId (= globalMsgId / realMsgId)
+          //   clientDelMsgId = client cliMsgId
+          //   destId         = thường là msgId gốc (thêm vào để tăng khả năng tìm thấy)
+          const globalId =
+            item.globalDelMsgId !== undefined && String(item.globalDelMsgId) !== '0'
+              ? String(item.globalDelMsgId)
+              : undefined;
+          const clientId =
+            item.clientDelMsgId !== undefined && String(item.clientDelMsgId) !== '0'
+              ? String(item.clientDelMsgId)
+              : undefined;
+          const destId =
+            item.destId !== undefined && String(item.destId) !== '0'
+              ? String(item.destId)
+              : undefined;
+
+          // Lookup lần lượt: msgStore (Zalo→TG messages) rồi sentMsgStore (TG→Zalo messages)
+          const tgMsgId =
+            (globalId ? (msgStore.getTgMsgId(globalId) ?? sentMsgStore.getByZaloMsgId(globalId)) : undefined) ??
+            (clientId ? (msgStore.getTgMsgId(clientId) ?? sentMsgStore.getByZaloMsgId(clientId)) : undefined) ??
+            (destId   ? (msgStore.getTgMsgId(destId)   ?? sentMsgStore.getByZaloMsgId(destId))   : undefined);
+
+          if (tgMsgId === undefined) {
+            // Tin nhắn bị xoá chưa từng được bridge (gửi trước khi bridge start,
+            // hoặc từ thiết bị khác) — gửi thông báo chung vào topic, không reply.
+            console.log(
+              `[ZaloHandler] chat.delete: no TG mapping — globalDelMsgId=${globalId} clientDelMsgId=${clientId} destId=${destId}`,
+              JSON.stringify(item),
+            );
+            await tg.sendMessage(
+              config.telegram.groupId,
+              `<i>🗑 Admin <b>${escapeHtml(delActorName)}</b> đã xoá một tin nhắn (chưa được bridge) trên Zalo</i>`,
+              {
+                message_thread_id: topicId,
+                parse_mode: 'HTML',
+              },
+            );
+            continue;
+          }
+
+          await tg.sendMessage(
+            config.telegram.groupId,
+            `<i>🗑 Tin nhắn này đã bị <b>${escapeHtml(delActorName)}</b> (admin) xoá trên Zalo</i>`,
+            {
+              message_thread_id: topicId,
+              parse_mode: 'HTML',
+              reply_parameters: { message_id: tgMsgId, allow_sending_without_reply: true },
+            },
+          );
+          console.log(`[ZaloHandler] chat.delete: notified TG msg ${tgMsgId} deleted by ${delActorName} (${delActorUid})`);
+        }
+        return;
+      }
+
       console.log(`[ZaloHandler] Unhandled msgType="${msgType}" content:`, JSON.stringify(msg.data.content));
       const fallback = type === ThreadType.Group
         ? `${groupCaption(senderLabel)}\n<i>[${msgType}]</i>`

@@ -117,15 +117,17 @@ function resolveTgMentions(
     for (const e of entities) {
       if (e.type === 'mention') {
         const rawName = text.slice(e.offset + 1, e.offset + e.length); // strip leading @
-        const uid = zaloId
+        const uid = (zaloId
           ? userCache.resolveByNameInGroup(rawName, zaloId)
-          : userCache.resolveByName(rawName);
+          : userCache.resolveByName(rawName))
+          ?? aliasCache.resolveByAlias(rawName);
         if (uid) result.push({ pos: e.offset, uid, len: e.length });
       } else if (e.type === 'text_mention' && e.user) {
         const rawName = e.user.first_name + (e.user.last_name ? ` ${e.user.last_name}` : '');
-        const uid = zaloId
+        const uid = (zaloId
           ? userCache.resolveByNameInGroup(rawName, zaloId)
-          : userCache.resolveByName(rawName);
+          : userCache.resolveByName(rawName))
+          ?? aliasCache.resolveByAlias(rawName);
         if (uid) result.push({ pos: e.offset, uid, len: e.length });
       }
     }
@@ -144,9 +146,10 @@ function resolveTgMentions(
       const words = captured.split(' ');
       for (let end = words.length; end >= 1; end--) {
         const candidate = words.slice(0, end).join(' ');
-        const uid = zaloId
+        const uid = (zaloId
           ? userCache.resolveByNameInGroup(candidate, zaloId)
-          : userCache.resolveByName(candidate);
+          : userCache.resolveByName(candidate))
+          ?? aliasCache.resolveByAlias(candidate);
         if (uid) {
           result.push({ pos: m.index, uid, len: ('@' + candidate).length });
           break;
@@ -1396,13 +1399,14 @@ export function setupTelegramHandler(
       );
       groupsCache.set([]);
     } catch (err) {
+      const errCode = (err as { code?: number })?.code;
       const errMsg = err instanceof Error ? err.message : String(err);
       console.error('[/joingroup]', err);
       // code 178 = already a member, 240 = requires admin approval
-      if (errMsg.includes('178')) {
+      if (errCode === 178 || errMsg.includes('178')) {
         await ctx.telegram.sendMessage(config.telegram.groupId, '⚠️ Bạn đã là thành viên nhóm này rồi.', replyOpts);
-      } else if (errMsg.includes('240')) {
-        await ctx.telegram.sendMessage(config.telegram.groupId, '⏳ Nhóm yêu cầu duyệt thành viên. Yêu cầu tham gia đã được gửi đi.', replyOpts);
+      } else if (errCode === 240 || errMsg.toLowerCase().includes('waiting') || errMsg.includes('240')) {
+        await ctx.telegram.sendMessage(config.telegram.groupId, '⏳ Nhóm yêu cầu duyệt thành viên. Yêu cầu tham gia đã được gửi — chờ admin duyệt.', replyOpts);
       } else {
         await ctx.telegram.sendMessage(config.telegram.groupId, '❌ Không thể tham gia nhóm. Link có thể đã hết hạn hoặc không hợp lệ.', replyOpts);
       }
@@ -1651,8 +1655,13 @@ export function setupTelegramHandler(
         await ctx.editMessageReplyMarkup(undefined);
         groupsCache.set([]);
       } catch (err) {
+        const errCode = (err as { code?: number })?.code;
         console.error('[cb/jgi]', err);
-        await ctx.answerCbQuery('❌ Không thể tham gia nhóm');
+        if (errCode === 240) {
+          await ctx.answerCbQuery('⏳ Yêu cầu đã gửi — chờ admin duyệt');
+        } else {
+          await ctx.answerCbQuery('❌ Không thể tham gia nhóm');
+        }
       }
       return;
     }

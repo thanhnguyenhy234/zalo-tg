@@ -524,14 +524,25 @@ export const userCache = {
 
 /** userId → alias (tên danh bạ người dùng tự đặt) */
 const _aliasMap = new Map<string, string>();
+/** normalised alias → userId (reverse lookup for mention resolution) */
+const _aliasNormToUid = new Map<string, string>();
 
 export const aliasCache = {
   /** Bulk-load from getAliasList response */
   setAll(items: Array<{ userId: string; alias: string }>): void {
     _aliasMap.clear();
+    _aliasNormToUid.clear();
     for (const { userId, alias } of items) {
-      if (alias?.trim()) _aliasMap.set(userId, alias.trim());
+      if (alias?.trim()) {
+        _aliasMap.set(userId, alias.trim());
+        _aliasNormToUid.set(_normName(alias), userId);
+      }
     }
+  },
+
+  /** Find a Zalo UID by alias name (for TG→Zalo mention via alias). */
+  resolveByAlias(rawName: string): string | undefined {
+    return _aliasNormToUid.get(_normName(rawName));
   },
 
   /** Get alias for a userId, or undefined if not set */

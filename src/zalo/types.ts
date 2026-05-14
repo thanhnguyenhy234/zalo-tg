@@ -45,6 +45,8 @@ export const ZALO_MSG_TYPES = {
   POLL:       'group.poll',
   // Contact card (shared profile) — Zalo sends as 'chat.forward' with msgType 6
   CONTACT:    'chat.forward',
+  // E-card / birthday notification
+  ECARD:      'chat.ecard',
 } as const;
 
 /** A single @mention inside a Zalo group message. */

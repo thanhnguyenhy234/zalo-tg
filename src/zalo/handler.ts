@@ -1291,6 +1291,45 @@ ${escapeHtml(photoCaption)}`
         }
       }
 
+      // ── 13. E-card (birthday / event notification) ────────────────────────
+      if (msgType === ZALO_MSG_TYPES.ECARD) {
+        const ecardTitle = media.title ?? '';
+        const ecardDesc  = media.description ?? '';
+        let ecardNotify  = '';
+        try {
+          const p = JSON.parse(media.params ?? '{}') as { notifyTxt?: string };
+          ecardNotify = p.notifyTxt ?? '';
+        } catch { /* ignore */ }
+
+        const lines: string[] = [];
+        if (type === ThreadType.Group) lines.push(groupCaption(senderName));
+        lines.push(`🎂 <b>${escapeHtml(ecardTitle)}</b>`);
+        if (ecardDesc && ecardDesc !== ecardTitle) lines.push(escapeHtml(ecardDesc));
+        if (ecardNotify) lines.push(`<i>${escapeHtml(ecardNotify)}</i>`);
+        const ecardCaption = lines.join('\n');
+
+        const imgUrl = media.href;
+        if (imgUrl) {
+          try {
+            const localPath = await downloadToTemp(imgUrl, `ecard_${Date.now()}.png`);
+            const sent = await tg.sendPhoto(
+              config.telegram.groupId,
+              { source: createReadStream(localPath) },
+              { ...tgBase, caption: ecardCaption, parse_mode: 'HTML' },
+            );
+            saveTgMapping(sent);
+            await cleanTemp(localPath);
+          } catch {
+            const sent = await tg.sendMessage(config.telegram.groupId, ecardCaption, { ...tgBase, parse_mode: 'HTML' });
+            saveTgMapping(sent);
+          }
+        } else {
+          const sent = await tg.sendMessage(config.telegram.groupId, ecardCaption, { ...tgBase, parse_mode: 'HTML' });
+          saveTgMapping(sent);
+        }
+        return;
+      }
+
       console.log(`[ZaloHandler] Unhandled msgType="${msgType}" content:`, JSON.stringify(msg.data.content));
       const fallback = type === ThreadType.Group
         ? `${groupCaption(senderLabel)}\n<i>[${msgType}]</i>`

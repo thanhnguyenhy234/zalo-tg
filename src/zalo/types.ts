@@ -79,6 +79,11 @@ export interface ZaloMessageData {
   ts:         string;
   msgType?:   string;
   ttl?:       number;
+  paramsExt?: {
+    countUnread?: number;
+    containType?: number;
+    platformType?: number;
+  };
   quote?:     ZaloTQuote;
   mentions?:  ZaloTMention[];  // group messages only
 }

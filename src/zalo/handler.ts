@@ -8,6 +8,7 @@ import { ZALO_MSG_TYPES } from './types.js';
 import { store } from '../store.js';
 import { tgBot } from '../telegram/bot.js';
 import { config } from '../config.js';
+import { unreadState } from '../unread-state.js';
 import { downloadToTemp, cleanTemp } from '../utils/media.js';
 import { applyMentionsHtml, applyZaloMarkupHtml, formatGroupMsgHtml, formatGroupMsg, groupCaption, topicName, truncate, escapeHtml } from '../utils/format.js';
 import type { ZaloStyle } from '../utils/format.js';
@@ -54,6 +55,28 @@ function parseBankCardHtml(html: string): BankCardInfo | null {
   return { bankName, accountNumber, holderName, vietqr };
 }
 
+type ZaloProfileLookup = {
+  displayName?: string;
+  zaloName?: string;
+  display_name?: string;
+};
+
+function getProfileByUid(
+  resp: {
+    changed_profiles?: Record<string, ZaloProfileLookup>;
+    unchanged_profiles?: Record<string, ZaloProfileLookup>;
+  } | undefined,
+  uid: string,
+): ZaloProfileLookup | undefined {
+  const uidKey = uid.includes('_') ? uid : `${uid}_0`;
+  return (
+    resp?.changed_profiles?.[uidKey]
+    ?? resp?.changed_profiles?.[uid]
+    ?? resp?.unchanged_profiles?.[uidKey]
+    ?? resp?.unchanged_profiles?.[uid]
+  );
+}
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 /**
@@ -89,14 +112,14 @@ async function populateGroupMemberCache(api: ZaloAPI, groupId: string): Promise<
     for (let i = 0; i < uids.length; i += BATCH) {
       const batch = uids.slice(i, i + BATCH);
       const resp = await api.getUserInfo(batch) as {
-        changed_profiles?: Record<string, { displayName?: string; zaloName?: string }>;
-        unchanged_profiles?: Record<string, unknown>;
+        changed_profiles?: Record<string, ZaloProfileLookup>;
+        unchanged_profiles?: Record<string, ZaloProfileLookup>;
       };
       const profiles = resp?.changed_profiles ?? {};
       // unchanged_profiles also has profile data
       const unchanged = resp?.unchanged_profiles ?? {};
       for (const uid of batch) {
-        const p = (profiles[uid] ?? unchanged[uid]) as { displayName?: string; zaloName?: string } | undefined;
+        const p = getProfileByUid({ changed_profiles: profiles, unchanged_profiles: unchanged }, uid);
         const name = p?.displayName?.trim() || p?.zaloName?.trim();
         if (uid && name) { userCache.saveForGroup(uid, name, groupId); saved++; }
       }
@@ -187,12 +210,10 @@ async function resolveUserDisplayName(api: ZaloAPI, uid: string | undefined, fal
 
   try {
     const resp = await api.getUserInfo(cleanUid) as {
-      changed_profiles?: Record<string, { displayName?: string; zaloName?: string }>;
-      unchanged_profiles?: Record<string, unknown>;
+      changed_profiles?: Record<string, ZaloProfileLookup>;
+      unchanged_profiles?: Record<string, ZaloProfileLookup>;
     };
-    const profile = (resp?.changed_profiles?.[cleanUid] ?? resp?.unchanged_profiles?.[cleanUid]) as
-      | { displayName?: string; zaloName?: string }
-      | undefined;
+    const profile = getProfileByUid(resp, cleanUid);
     const name = profile?.displayName?.trim() || profile?.zaloName?.trim();
     if (name) {
       userCache.save(cleanUid, name);
@@ -202,7 +223,66 @@ async function resolveUserDisplayName(api: ZaloAPI, uid: string | undefined, fal
     console.warn(`[Zalo] resolveUserDisplayName failed for ${cleanUid}:`, err);
   }
 
-  return cleanUid || fallback;
+  return (fallback && fallback !== 'ai đó') ? fallback : (cleanUid || fallback);
+}
+
+function preferredDmTopicDisplayName(zaloId: string, realName: string): string {
+  const displayName = realName.trim() || `Zalo ${zaloId}`;
+  return aliasCache.preferredName(zaloId, displayName);
+}
+
+async function syncTopicTitleIfNeeded(
+  topicId: number,
+  zaloId: string,
+  type: 0 | 1,
+  desiredName: string,
+): Promise<void> {
+  const trimmedName = desiredName.trim();
+  if (!trimmedName || topicId === 1) return;
+
+  const existing = store.getEntryByTopic(topicId);
+  if (existing?.name === trimmedName) return;
+
+  try {
+    await tg.editForumTopic(
+      config.telegram.groupId,
+      topicId,
+      { name: topicName(trimmedName, type) },
+    );
+    store.set(existing
+      ? { ...existing, name: trimmedName }
+      : { topicId, zaloId, type, name: trimmedName });
+    console.log(`[Zalo→TG] Synced topic ${topicId} name to "${trimmedName}"`);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (msg.includes('TOPIC_NOT_MODIFIED')) {
+      store.set(existing
+        ? { ...existing, name: trimmedName }
+        : { topicId, zaloId, type, name: trimmedName });
+      console.log(`[Zalo→TG] Topic ${topicId} already had desired name "${trimmedName}"`);
+      return;
+    }
+    if (msg.includes('TOPIC_ID_INVALID') || isTopicDeletedError(err)) {
+      console.warn(`[Zalo→TG] Topic ${topicId} disappeared while syncing name — removing stale mapping`);
+      store.remove(topicId);
+      return;
+    }
+    console.warn(`[Zalo→TG] Failed to sync topic ${topicId} name to "${trimmedName}":`, err);
+  }
+}
+
+async function syncExistingDmTopicAliases(): Promise<void> {
+  let renamed = 0;
+  for (const entry of store.all()) {
+    if (entry.type !== 0 || entry.topicId === 1) continue;
+    const desiredName = aliasCache.preferredName(entry.zaloId, entry.name);
+    if (desiredName === entry.name) continue;
+    await syncTopicTitleIfNeeded(entry.topicId, entry.zaloId, entry.type, desiredName);
+    renamed += 1;
+  }
+  if (renamed > 0) {
+    console.log(`[Zalo] Synced ${renamed} existing DM topic name(s) to aliases`);
+  }
 }
 
 async function getOrCreateTopic(
@@ -214,7 +294,10 @@ async function getOrCreateTopic(
 ): Promise<number> {
   if (!forceRecreate) {
     const existing = store.getTopicByZalo(zaloId, type);
-    if (existing !== undefined) return existing;
+    if (existing !== undefined) {
+      await syncTopicTitleIfNeeded(existing, zaloId, type, displayName);
+      return existing;
+    }
   }
 
   const pendingKey = `${type}:${zaloId}`;
@@ -368,6 +451,31 @@ const _memberCacheLoaded = new Set<string>();
  */
 const _inFlightMsgIds = new Set<string>();
 
+type ZaloAliasListResponse = {
+  items?: Array<{ userId?: string; alias?: string }>;
+};
+
+async function getAllAliasItems(api: ZaloAPI): Promise<Array<{ userId: string; alias: string }>> {
+  const items: Array<{ userId: string; alias: string }> = [];
+  const pageSize = 200;
+  const maxPages = 20;
+
+  for (let page = 1; page <= maxPages; page += 1) {
+    const resp = await api.getAliasList(pageSize, page) as ZaloAliasListResponse | undefined;
+    const pageItems = Array.isArray(resp?.items) ? resp.items : [];
+
+    for (const item of pageItems) {
+      const userId = typeof item?.userId === 'string' ? item.userId.trim() : '';
+      const alias = typeof item?.alias === 'string' ? item.alias.trim() : '';
+      if (userId && alias) items.push({ userId, alias });
+    }
+
+    if (pageItems.length < pageSize) break;
+  }
+
+  return items;
+}
+
 export async function setupZaloHandler(api: ZaloAPI): Promise<void> {
   // Pre-populate userCache for all existing group topics on startup
   for (const entry of store.all()) {
@@ -380,10 +488,11 @@ export async function setupZaloHandler(api: ZaloAPI): Promise<void> {
   // Load alias list (tên danh bạ) BEFORE attaching listeners so that the first
   // message event already has aliases available for topic naming.
   try {
-    const result = await api.getAliasList() as { items?: Array<{ userId: string; alias: string }> };
-    if (result?.items?.length) {
-      aliasCache.setAll(result.items);
-      console.log(`[Zalo] Loaded ${result.items.length} aliases from address book`);
+    const aliasItems = await getAllAliasItems(api);
+    if (aliasItems.length > 0) {
+      aliasCache.setAll(aliasItems);
+      console.log(`[Zalo] Loaded ${aliasItems.length} aliases from address book`);
+      await syncExistingDmTopicAliases();
     }
   } catch (err) {
     console.warn('[Zalo] Failed to load alias list:', err);
@@ -401,9 +510,12 @@ export async function setupZaloHandler(api: ZaloAPI): Promise<void> {
           selfMsgIds.some(id => sentMsgStore.getByZaloMsgId(id) !== undefined)
           || sentMsgStore.isSendingTo(msg.threadId);
         if (isEcho) {
+          unreadState.clear(msg.threadId, msg.type as 0 | 1);
+          console.log(`[UnreadState] Cleared unread via bot echo for ${msg.threadId}`);
           console.log(`[Zalo→TG] Skip bot echo (${selfMsgIds.join(', ')})`);
           return;
         }
+        unreadState.clear(msg.threadId, msg.type as 0 | 1);
         // isSelf but NOT a bot echo → user sent from Zalo app, forward to TG
       }
 
@@ -426,6 +538,16 @@ export async function setupZaloHandler(api: ZaloAPI): Promise<void> {
       const type       = msg.type as 0 | 1;
       const senderName = msg.data.dName ?? msg.data.uidFrom;
       const msgType    = msg.data.msgType ?? ZALO_MSG_TYPES.TEXT;
+
+      const unreadCount = msg.data.paramsExt?.countUnread;
+      if (!msg.isSelf && typeof unreadCount === 'number' && Number.isFinite(unreadCount) && unreadCount > 0) {
+        const unreadMsgIds = [msg.data.msgId, msg.data.realMsgId]
+          .filter((value): value is string => typeof value === 'string' && value.length > 0 && value !== '0');
+        unreadState.remember(zaloId, type, unreadCount, { lastMsgIds: unreadMsgIds });
+        if (type === ThreadType.User) {
+          console.log(`[UnreadState] Remember user unread thread=${zaloId} count=${unreadCount} msgIds=${unreadMsgIds.join(',') || '-'}`);
+        }
+      }
 
       if (type === ThreadType.Group && await isMutedZaloGroup(api, zaloId)) {
         console.log(`[Zalo→TG] Skip muted group ${zaloId}`);
@@ -479,10 +601,11 @@ export async function setupZaloHandler(api: ZaloAPI): Promise<void> {
       } else {
         // For DMs, zaloId is the peer's UID — resolve their real name then apply alias
         const realName = await resolveUserDisplayName(api, zaloId, senderName);
-        displayName = aliasCache.label(zaloId, realName);
+        displayName = preferredDmTopicDisplayName(zaloId, realName);
       }
 
       const topicId = await getOrCreateTopic(zaloId, type, displayName, groupAvatarUrl);
+      const senderLabel = type === ThreadType.Group ? senderName : displayName;
 
       // Resolve Telegram reply target from incoming Zalo quote (if any)
       let tgReplyMsgId: number | undefined;
@@ -521,7 +644,7 @@ export async function setupZaloHandler(api: ZaloAPI): Promise<void> {
         tgBase.reply_parameters = { message_id: tgReplyMsgId, allow_sending_without_reply: true };
       }
 
-      const caption = groupCaption(senderName);
+      const caption = groupCaption(senderLabel);
       const tgOpts  = { ...tgBase, parse_mode: 'HTML' as const, caption };
 
       // Build quote data + mapping helper — saved after every successful TG send
@@ -574,7 +697,7 @@ export async function setupZaloHandler(api: ZaloAPI): Promise<void> {
         const bodyHtml = (mentions?.length || styles?.length)
           ? applyZaloMarkupHtml(truncate(body), mentions, styles)
           : escapeHtml(truncate(body));
-        const tgText = formatGroupMsgHtml(senderName, bodyHtml);
+        const tgText = formatGroupMsgHtml(senderLabel, bodyHtml);
         const sent = await tg.sendMessage(
           config.telegram.groupId,
           tgText,
@@ -610,7 +733,7 @@ export async function setupZaloHandler(api: ZaloAPI): Promise<void> {
           albumKey,
           url,
           zaloMsgIds,
-          { senderName, topicId, tgBase, zaloQuote: zaloQuoteData },
+          { senderName: senderLabel, topicId, tgBase, zaloQuote: zaloQuoteData },
           async (buf) => {
             if (buf.urls.length === 1) {
               // Single photo — reuse eagerly started download (likely already done)
@@ -791,7 +914,7 @@ ${escapeHtml(photoCaption)}`
             let sent: { message_id: number };
             if (isAnimated) {
               // Animated stickers are sprite sheets — send as photo with label
-              const animCaption = `${groupCaption(senderName)} <i>(sticker động 🎥)</i>`;
+              const animCaption = `${groupCaption(senderLabel)} <i>(sticker động 🎥)</i>`;
               const stream = createReadStream(localPath);
               sent = await tg.sendPhoto(config.telegram.groupId, { source: stream }, {
                 ...tgBase,
@@ -823,6 +946,18 @@ ${escapeHtml(photoCaption)}`
 
       // ── 8. Link (chat.recommended) ─────────────────────────────────────────
       if (msgType === ZALO_MSG_TYPES.LINK) {
+        if (media.action === 'recommened.misscall') {
+          let params: { duration?: number; isCaller?: number; calltype?: number } = {};
+          try { params = JSON.parse(media.params ?? '{}'); } catch { /* ignore */ }
+
+          const callText = params.calltype === 1
+            ? '📹 cuộc gọi video nhỡ'
+            : '📞 cuộc gọi thoại nhỡ';
+          const sent = await tg.sendMessage(config.telegram.groupId, callText, tgBase);
+          saveTgMapping(sent);
+          return;
+        }
+
         // `href` is the canonical URL; fall back to `src` or the `msg` text field
         // (both can carry the URL in some Zalo client versions).
         const rawMedia = media as Record<string, unknown>;
@@ -838,7 +973,7 @@ ${escapeHtml(photoCaption)}`
           return;
         }
         const safeTitle = escapeHtml(title);
-        const linkText  = `${groupCaption(senderName)}\n<a href="${href}">${safeTitle}</a>`;
+        const linkText  = `${groupCaption(senderLabel)}\n<a href="${href}">${safeTitle}</a>`;
         const sent = await tg.sendMessage(config.telegram.groupId, linkText, {
           ...tgBase,
           parse_mode: 'HTML',
@@ -871,7 +1006,7 @@ ${escapeHtml(photoCaption)}`
                 if (info.bankName)      caption += `\nNgân hàng: <b>${info.bankName}</b>`;
                 if (info.accountNumber) caption += `\nSTK: <code>${info.accountNumber}</code>`;
                 if (info.holderName)    caption += `\nChủ TK: <b>${info.holderName}</b>`;
-                const fullCaption = `${groupCaption(senderName)}\n${caption}`;
+                const fullCaption = `${groupCaption(senderLabel)}\n${caption}`;
                 const sent = await tg.sendPhoto(
                   config.telegram.groupId,
                   { source: qrBuf },
@@ -909,7 +1044,7 @@ ${escapeHtml(photoCaption)}`
         };
         const icon = ACTION_ICONS[media.action ?? ''] ?? '📋';
         const body = `${icon} ${label}`;
-        const text = `${groupCaption(senderName)}\n${body}`;
+        const text = `${groupCaption(senderLabel)}\n${body}`;
         const sent = await tg.sendMessage(config.telegram.groupId, text, {
           ...tgBase,
           parse_mode: 'HTML',
@@ -939,7 +1074,7 @@ ${escapeHtml(photoCaption)}`
           // Send sender name as a follow-up caption since sendLocation has no HTML caption
             await tg.sendMessage(
               config.telegram.groupId,
-              `${groupCaption(senderName)}📍 Vị trí`,
+              `${groupCaption(senderLabel)}📍 Vị trí`,
               { ...tgBase, parse_mode: 'HTML' },
             );
           saveTgMapping(sent);
@@ -947,7 +1082,7 @@ ${escapeHtml(photoCaption)}`
           // Fallback: Google Maps link
           const mapsUrl = media.href || '#';
           const body    = `📍 <a href="${mapsUrl}">Vị trí</a>`;
-          const text    = `${groupCaption(senderName)}\n${body}`;
+          const text    = `${groupCaption(senderLabel)}\n${body}`;
           const sent    = await tg.sendMessage(config.telegram.groupId, text, { ...tgBase, parse_mode: 'HTML' });
           saveTgMapping(sent);
         }
@@ -995,7 +1130,7 @@ ${escapeHtml(photoCaption)}`
           if (options.length < 2) {
             // Can't create TG poll with < 2 options, send as text
             const text = type === ThreadType.Group
-              ? `${groupCaption(senderName)}📊 <b>${escapeHtml(question)}</b>\n<i>Cuộc bình chọn mới (${options.length} lựa chọn)</i>`
+              ? `${groupCaption(senderLabel)}📊 <b>${escapeHtml(question)}</b>\n<i>Cuộc bình chọn mới (${options.length} lựa chọn)</i>`
               : `📊 <b>${escapeHtml(question)}</b>`;
             const sent = await tg.sendMessage(config.telegram.groupId, text, { ...tgBase, parse_mode: 'HTML' });
             saveTgMapping(sent);
@@ -1108,9 +1243,11 @@ ${escapeHtml(photoCaption)}`
           if (uid && contactName === uid) {
             try {
               const resp = await api.getUserInfo(uid) as {
-                changed_profiles?: Record<string, { displayName?: string }>;
+                changed_profiles?: Record<string, ZaloProfileLookup>;
+                unchanged_profiles?: Record<string, ZaloProfileLookup>;
               };
-              contactName = resp?.changed_profiles?.[uid]?.displayName ?? uid;
+              const profile = getProfileByUid(resp, uid);
+              contactName = profile?.displayName?.trim() || profile?.zaloName?.trim() || uid;
               if (contactName !== uid) userCache.save(uid, contactName);
             } catch { /* non-fatal */ }
           }
@@ -1120,7 +1257,7 @@ ${escapeHtml(photoCaption)}`
               : media.qrCodeUrl;
 
           const body = `👤 <b>Danh thiếp</b>\nTên: <b>${escapeHtml(contactName)}</b>\nZalo ID: <code>${uid}</code>`;
-          const fullText = type === ThreadType.Group ? `${groupCaption(senderName)}\n${body}` : body;
+          const fullText = type === ThreadType.Group ? `${groupCaption(senderLabel)}\n${body}` : body;
 
           if (qrUrl) {
             // Send QR code image + caption
@@ -1148,7 +1285,7 @@ ${escapeHtml(photoCaption)}`
 
       console.log(`[ZaloHandler] Unhandled msgType="${msgType}" content:`, JSON.stringify(msg.data.content));
       const fallback = type === ThreadType.Group
-        ? `${groupCaption(senderName)}\n<i>[${msgType}]</i>`
+        ? `${groupCaption(senderLabel)}\n<i>[${msgType}]</i>`
         : `<i>[${msgType}]</i>`;
       const sentFallback = await tg.sendMessage(config.telegram.groupId, fallback, {
         ...tgBase,
@@ -1167,6 +1304,51 @@ ${escapeHtml(photoCaption)}`
       } else {
         console.error('[ZaloHandler] Error:', err);
       }
+    }
+  });
+
+  // ── Seen events ────────────────────────────────────────────────────────────
+  // zca-js only exposes a reliable self flag for group seen events. For 1:1
+  // chats we match the seen event against the latest unread message IDs that we
+  // cached when the incoming message arrived. Legacy cache rows without message
+  // IDs fall back to a one-time heuristic clear on the next user seen event.
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  api.listener.on('seen_messages', async (events: any[]) => {
+    try {
+      for (const event of events ?? []) {
+        const threadId = typeof event?.threadId === 'string' ? event.threadId : undefined;
+        if (!threadId) continue;
+
+        if (event?.type === ThreadType.Group && event?.isSelf) {
+          unreadState.clear(threadId, 1);
+          continue;
+        }
+
+        if (event?.type !== ThreadType.User) continue;
+
+        const existing = unreadState.get(threadId, 0);
+
+        const seenMsgIds = [event?.data?.msgId, event?.data?.realMsgId]
+          .filter((value): value is string => typeof value === 'string' && value.length > 0 && value !== '0');
+
+        console.log(`[UnreadState] User seen event thread=${threadId} seenMsgIds=${seenMsgIds.join(',') || '-'} cached=${existing?.lastMsgIds?.join(',') || '-'} hasEntry=${existing ? 'yes' : 'no'}`);
+        if (!existing) continue;
+
+        if (existing.lastMsgIds?.length) {
+          if (!unreadState.matchesMessageIds(threadId, 0, seenMsgIds)) {
+            console.log(`[UnreadState] User seen mismatch thread=${threadId}`);
+            continue;
+          }
+          unreadState.clear(threadId, 0);
+          console.log(`[UnreadState] Cleared user unread via seen_messages match for ${threadId}`);
+          continue;
+        }
+
+        unreadState.clear(threadId, 0);
+        console.log(`[UnreadState] Cleared legacy user unread via seen_messages heuristic for ${threadId}`);
+      }
+    } catch (err) {
+      console.error('[ZaloHandler] seen_messages error:', err);
     }
   });
 
@@ -1477,10 +1659,12 @@ ${escapeHtml(photoCaption)}`
       // Resolve display name
       let displayName = fromUid;
       try {
-        const info = await api.getUserInfo(fromUid) as {
-          userId?: string; zaloName?: string; display_name?: string;
-        } | undefined;
-        displayName = info?.display_name ?? info?.zaloName ?? fromUid;
+        const resp = await api.getUserInfo(fromUid) as {
+          changed_profiles?: Record<string, ZaloProfileLookup>;
+          unchanged_profiles?: Record<string, ZaloProfileLookup>;
+        };
+        const profile = getProfileByUid(resp, fromUid);
+        displayName = profile?.displayName?.trim() || profile?.display_name?.trim() || profile?.zaloName?.trim() || fromUid;
       } catch { /* use uid as fallback */ }
 
       const msgText = data?.message?.trim();

@@ -24,6 +24,15 @@ function envFlag(key: string, defaultValue = false): boolean {
   return ['1', 'true', 'yes', 'on'].includes(raw.trim().toLowerCase());
 }
 
+function envNumberList(key: string): number[] {
+  const raw = process.env[key]?.trim();
+  if (!raw) return [];
+  return raw
+    .split(',')
+    .map((part) => Number(part.trim()))
+    .filter((value) => Number.isFinite(value));
+}
+
 export const config = {
   telegram: {
     token:       requireEnv('TG_TOKEN'),
@@ -34,6 +43,7 @@ export const config = {
     localServer: envFlag('LOCAL_BOT_API')
       ? (process.env.TG_LOCAL_SERVER?.replace(/\/$/, '') || null)
       : null,
+    allowedPrivateUserIds: envNumberList('TG_ALLOWED_PRIVATE_USER_IDS'),
   },
   zalo: {
     credentialsPath: resolvePath(process.env.ZALO_CREDENTIALS_PATH, 'credentials.json'),

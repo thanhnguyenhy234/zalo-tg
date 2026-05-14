@@ -1,17 +1,97 @@
 import { ThreadType } from 'zca-js';
 import path from 'path';
 import { createReadStream } from 'fs';
+import { stat, open } from 'fs/promises';
+import { execFile } from 'child_process';
+import { promisify } from 'util';
 
 import type { ZaloAPI } from '../zalo/types.js';
 import { store, msgStore, userCache, friendsCache, groupsCache, sentMsgStore, pollStore, mediaGroupStore, reactionEchoStore, aliasCache } from '../store.js';
 import { tgBot } from './bot.js';
 import { config } from '../config.js';
+import { unreadState } from '../unread-state.js';
 import { downloadToTemp, cleanTemp, convertToM4a, extractVideoThumbnail, convertWebmToGif, convertTgsToGif } from '../utils/media.js';
 import { triggerQRLogin } from '../zalo/client.js';
 import { escapeHtml } from '../utils/format.js';
 
 // Bridge start time (module load = process start)
 const _bridgeStartTime = Date.now();
+
+function extractZaloSentMsgId(result: unknown): string | number | undefined {
+  const payload = result as {
+    message?: { msgId?: string | number } | null;
+    attachment?: Array<{ msgId?: string | number }>;
+  };
+  return payload?.message?.msgId ?? payload?.attachment?.[0]?.msgId;
+}
+
+const execFileAsync = promisify(execFile);
+
+async function getLocalApiStatus(serverUrl: string): Promise<string> {
+  const lines: string[] = [];
+
+  let httpOk = false;
+  let httpMs = -1;
+  try {
+    const axios = (await import('axios')).default;
+    const t0 = Date.now();
+    const res = await axios.get(`${serverUrl}/`, { timeout: 4000, validateStatus: () => true });
+    httpMs = Date.now() - t0;
+    httpOk = res.status < 500;
+  } catch { /* ignore */ }
+
+  if (httpOk) lines.push(`🟢 HTTP: <b>online</b> (${httpMs} ms)`);
+  else lines.push('🔴 HTTP: <b>offline / ECONNREFUSED</b>');
+
+  try {
+    const { stdout } = await execFileAsync('pgrep', ['-a', 'telegram-bot-api']);
+    const pid = stdout.trim().split(/\s+/)[0];
+    if (pid) {
+      lines.push(`⚙️ PID: <code>${pid}</code>`);
+      try {
+        const { stdout: mem } = await execFileAsync('ps', ['-p', pid, '-o', 'rss=']);
+        const kb = Number.parseInt(mem.trim(), 10);
+        if (!Number.isNaN(kb)) lines.push(`💾 RAM: <code>${(kb / 1024).toFixed(1)} MB</code>`);
+      } catch { /* ignore */ }
+    } else {
+      lines.push('⚙️ Process: <b>không tìm thấy</b>');
+    }
+  } catch {
+    lines.push('⚙️ Process: <b>không tìm thấy</b>');
+  }
+
+  const logPath = path.join(config.dataDir, 'bot-api', 'bot-api.log');
+  try {
+    const logStat = await stat(logPath);
+    const sizeMb = (Number(logStat.size) / 1024 / 1024).toFixed(2);
+    const fh = await open(logPath, 'r');
+    try {
+      const buf = Buffer.alloc(Math.min(4096, Number(logStat.size)));
+      await fh.read(buf, 0, buf.length, Math.max(0, Number(logStat.size) - buf.length));
+      const tail = buf.toString('utf8').trim().split('\n').slice(-3).join('\n');
+      const lastLine = tail.split('\n').pop() ?? '';
+      const hasError = /error|crash|fatal|signal 6|no space/i.test(lastLine);
+      lines.push(`📄 Log: <code>${sizeMb} MB</code> — dòng cuối:`);
+      lines.push(`<pre>${escapeHtml(lastLine.slice(0, 200))}</pre>`);
+      if (hasError) lines.push('⚠️ Phát hiện lỗi trong log!');
+    } finally {
+      await fh.close();
+    }
+  } catch {
+    lines.push('📄 Log: <i>không đọc được</i>');
+  }
+
+  try {
+    const { stdout } = await execFileAsync('df', ['-h', '/']);
+    const row = stdout.trim().split('\n')[1] ?? '';
+    const cols = row.trim().split(/\s+/);
+    if (cols.length >= 5) {
+      lines.push(`💿 Disk /: ${cols[1]} total, ${cols[2]} used, ${cols[3]} avail (<b>${cols[4]}</b>)`);
+    }
+  } catch { /* ignore */ }
+
+  return lines.join('\n');
+}
 
 
 // ── Mention resolution helper ──────────────────────────────────────────────
@@ -133,6 +213,234 @@ function truncateSearchLabel(value: string, limit = 48): string {
   return compact.length > limit ? `${compact.slice(0, limit - 1)}…` : compact;
 }
 
+type ZaloUnreadMark = {
+  id: number | string;
+  cliMsgId?: number;
+  fromUid?: number;
+  ts?: number;
+};
+
+type ZaloUnreadResponse = {
+  data?: {
+    convsGroup?: ZaloUnreadMark[];
+    convsUser?: ZaloUnreadMark[];
+  };
+};
+
+type ZaloMuteEntry = {
+  id: string | number;
+  duration: number;
+  startTime: number;
+  systemTime?: number;
+  currentTime?: number;
+};
+
+type ZaloMuteResponse = {
+  chatEntries?: ZaloMuteEntry[];
+  groupChatEntries?: ZaloMuteEntry[];
+};
+
+type UnreadDashboardItem = {
+  topicId: number;
+  type: 0 | 1;
+  name: string;
+  muted: boolean;
+  displayCount: string;
+  numericSort: number;
+  url: string;
+};
+
+type UnreadDashboardButton =
+  | { text: string; callback_data: string }
+  | { text: string; url: string };
+
+const STALE_UNREAD_USER_MS = 60 * 1000;
+const STALE_UNREAD_GROUP_MS = 12 * 60 * 60 * 1000;
+
+function getStaleUnreadMs(type: 0 | 1): number {
+  return type === 1 ? STALE_UNREAD_GROUP_MS : STALE_UNREAD_USER_MS;
+}
+
+function unreadConversationKey(zaloId: string, type: 0 | 1): string {
+  return `${type}:${zaloId}`;
+}
+
+function isActiveMuteEntry(entry: ZaloMuteEntry): boolean {
+  if (entry.duration === -1) return true;
+  if (entry.duration <= 0) return false;
+
+  const now = entry.currentTime ?? entry.systemTime ?? Math.floor(Date.now() / 1000);
+  const expiresAt = entry.startTime + entry.duration;
+  return now < expiresAt;
+}
+
+function truncateUnreadButtonLabel(value: string, limit = 42): string {
+  const compact = value.replace(/\s+/g, ' ').trim();
+  return compact.length > limit ? `${compact.slice(0, limit - 1)}…` : compact;
+}
+
+function formatUnreadTopicLine(item: UnreadDashboardItem): string {
+  const icon = item.type === 1 ? '👥' : '👤';
+  return `• ${icon} <b>${escapeHtml(item.name)}</b> — ${item.displayCount} tin chưa đọc`;
+}
+
+async function buildUnreadDashboard(api: ZaloAPI): Promise<{
+  text: string;
+  replyMarkup: {
+    inline_keyboard: UnreadDashboardButton[][];
+  };
+}> {
+  let unreadResp: ZaloUnreadResponse | null = null;
+  try {
+    unreadResp = await api.getUnreadMark() as ZaloUnreadResponse;
+  } catch (err) {
+    console.error('[/unread] getUnreadMark failed:', err);
+  }
+
+  let muteUnavailable = false;
+  const muteResp = await (api.getMute() as Promise<ZaloMuteResponse>)
+    .catch((err) => {
+      console.error('[/unread] getMute failed:', err);
+      muteUnavailable = true;
+      return null;
+    });
+
+  const merged = new Map<string, {
+    zaloId: string;
+    type: 0 | 1;
+    count?: number;
+    manualMarks: number;
+  }>();
+
+  for (const entry of unreadState.all()) {
+    if (Date.now() - entry.updatedAt >= getStaleUnreadMs(entry.type)) continue;
+    merged.set(unreadConversationKey(entry.zaloId, entry.type), {
+      zaloId: entry.zaloId,
+      type: entry.type,
+      count: entry.count,
+      manualMarks: 0,
+    });
+  }
+
+  const pushUnreadMarks = (items: ZaloUnreadMark[] | undefined, type: 0 | 1) => {
+    for (const item of items ?? []) {
+      const zaloId = String(item.id);
+      const key = unreadConversationKey(zaloId, type);
+      const existing = merged.get(key);
+      if (existing) {
+        existing.manualMarks += 1;
+      } else {
+        merged.set(key, {
+          zaloId,
+          type,
+          manualMarks: 1,
+        });
+      }
+    }
+  };
+
+  pushUnreadMarks(unreadResp?.data?.convsUser, 0);
+  pushUnreadMarks(unreadResp?.data?.convsGroup, 1);
+
+  const mutedKeys = new Set<string>();
+  for (const entry of muteResp?.chatEntries ?? []) {
+    if (isActiveMuteEntry(entry)) mutedKeys.add(unreadConversationKey(String(entry.id), 0));
+  }
+  for (const entry of muteResp?.groupChatEntries ?? []) {
+    if (isActiveMuteEntry(entry)) mutedKeys.add(unreadConversationKey(String(entry.id), 1));
+  }
+
+  const soundOn: UnreadDashboardItem[] = [];
+  const soundOff: UnreadDashboardItem[] = [];
+  let unmappedCount = 0;
+  let hasApproximateCount = false;
+
+  for (const entry of merged.values()) {
+    const topicId = store.getTopicByZalo(entry.zaloId, entry.type);
+    if (topicId === undefined) {
+      unmappedCount += 1;
+      continue;
+    }
+
+    const topicEntry = store.getEntryByTopic(topicId);
+    const fallbackCount = entry.manualMarks > 1 ? entry.manualMarks : undefined;
+    const numericCount = entry.count && entry.count > 0 ? entry.count : fallbackCount;
+    const displayCount = numericCount && numericCount > 0
+      ? String(numericCount)
+      : `≥${Math.max(1, entry.manualMarks)}`;
+
+    if (!(numericCount && numericCount > 0)) hasApproximateCount = true;
+
+    const item: UnreadDashboardItem = {
+      topicId,
+      type: entry.type,
+      name: topicEntry?.name ?? (entry.type === 1 ? `Nhóm ${entry.zaloId}` : `Chat ${entry.zaloId}`),
+      muted: mutedKeys.has(unreadConversationKey(entry.zaloId, entry.type)),
+      displayCount,
+      numericSort: numericCount ?? Math.max(1, entry.manualMarks),
+      url: buildTopicUrl(topicId),
+    };
+
+    if (item.muted) soundOff.push(item);
+    else soundOn.push(item);
+  }
+
+  const sorter = (a: UnreadDashboardItem, b: UnreadDashboardItem) =>
+    b.numericSort - a.numericSort || a.name.localeCompare(b.name, 'vi');
+  soundOn.sort(sorter);
+  soundOff.sort(sorter);
+
+  const now = new Date().toLocaleTimeString('vi-VN', { hour12: false });
+  const lines: string[] = [
+    '📬 <b>Topic có tin Zalo chưa đọc</b>',
+    `🕒 Cập nhật: <code>${now}</code>`,
+    '',
+  ];
+
+  if (soundOn.length === 0 && soundOff.length === 0) {
+    lines.push('✅ Hiện không có topic nào đang có unread signal mà bridge nhìn thấy.');
+  } else {
+    lines.push(`1️⃣ <b>Vẫn bật thông báo trên Zalo</b> (${soundOn.length})`);
+    if (soundOn.length === 0) lines.push('• Không có topic nào.');
+    else lines.push(...soundOn.map(formatUnreadTopicLine));
+
+    lines.push('', `2️⃣ <b>Đã tắt thông báo trên Zalo</b> (${soundOff.length})`);
+    if (soundOff.length === 0) lines.push('• Không có topic nào.');
+    else lines.push(...soundOff.map(formatUnreadTopicLine));
+  }
+
+  if (unmappedCount > 0) {
+    lines.push('', `⚠️ Bỏ qua ${unmappedCount} cuộc trò chuyện unread chưa có topic bridge.`);
+  }
+  if (hasApproximateCount) {
+    lines.push('', 'ℹ️ Ký hiệu <code>≥1</code> nghĩa là bridge mới biết chắc đang còn unread, nhưng chưa có số đếm mới đủ tin cậy.');
+  }
+  lines.push('', '🧠 Nguồn dữ liệu: unread cache do bridge quan sát khi tin nhắn đi vào + mark unread thủ công của Zalo nếu có.');
+  lines.push('⏱ Chat 1:1 sẽ tự ẩn nếu bridge không còn thấy unread signal mới trong khoảng 1 phút; group giữ lâu hơn cho tới khi có clear signal đáng tin cậy.');
+  if (muteUnavailable) {
+    lines.push('', '⚠️ Tạm thời không đọc được trạng thái mute từ Zalo, nên tất cả topic đang được xếp vào nhóm bật thông báo.');
+  }
+
+  const inline_keyboard: UnreadDashboardButton[][] = [
+    [{ text: '🔄 Làm mới', callback_data: 'ur:refresh' }],
+  ];
+
+  for (const item of [...soundOn, ...soundOff]) {
+    const icon = item.type === 1 ? '👥' : '👤';
+    inline_keyboard.push([
+      {
+        text: `${icon} ${truncateUnreadButtonLabel(`${item.name} (${item.displayCount})`)}`,
+        url: item.url,
+      },
+    ]);
+  }
+
+  return {
+    text: lines.join('\n'),
+    replyMarkup: { inline_keyboard },
+  };
+}
+
 type ZaloAliasListResponse = {
   items?: Array<{ userId?: string; alias?: string }>;
 };
@@ -161,6 +469,11 @@ async function getAllFriendAliases(api: ZaloAPI): Promise<Array<{ userId: string
 function formatFriendSearchLabel(friend: { userId: string; displayName: string; alias?: string }): string {
   const displayName = friend.displayName.trim() || `Zalo ${friend.userId}`;
   return aliasCache.label(friend.userId, displayName);
+}
+
+function preferredDmTopicName(userId: string, realName: string): string {
+  const displayName = realName.trim() || `Zalo ${userId}`;
+  return aliasCache.preferredName(userId, displayName);
 }
 
 async function refreshFriendsCache(api: ZaloAPI): Promise<void> {
@@ -203,8 +516,8 @@ async function ensureDmTopicForUser(user: OpenPhoneSearchUser): Promise<EnsuredD
 
   const cachedFriend = friendsCache.getByUserId(user.uid);
   const displayName = cachedFriend
-    ? formatFriendSearchLabel(cachedFriend)
-    : aliasCache.label(user.uid, user.display_name || user.zalo_name || `Zalo ${user.uid}`);
+    ? preferredDmTopicName(user.uid, cachedFriend.displayName)
+    : preferredDmTopicName(user.uid, user.display_name || user.zalo_name || `Zalo ${user.uid}`);
 
   const existingTopicId = store.getTopicByZalo(user.uid, 0);
   if (existingTopicId !== undefined) {
@@ -589,6 +902,57 @@ export function setupTelegramHandler(
       parts.join('\n'),
       { ...replyOpts, parse_mode: 'HTML', reply_markup: { inline_keyboard: buttons } },
     );
+  });
+
+  tgBot.command('unread', async (ctx) => {
+    const isPrivate = ctx.chat.type === 'private';
+    const isFromGroup = ctx.chat.id === config.telegram.groupId;
+    const isAllowedPrivate = isPrivate
+      && ctx.from !== undefined
+      && config.telegram.allowedPrivateUserIds.includes(ctx.from.id);
+
+    if (!isFromGroup && !isAllowedPrivate) {
+      if (isPrivate) {
+        await ctx.telegram.sendMessage(
+          ctx.chat.id,
+          '❌ Lệnh này chỉ dùng trong group bridge hoặc từ private chat đã được cấp quyền.',
+        );
+      } else {
+        console.log(`[/unread] Bỏ qua từ chat ${ctx.chat.id} (không phải group ${config.telegram.groupId} hoặc private allowlist)`);
+      }
+      return;
+    }
+
+    const targetChatId = ctx.chat.id;
+    const threadId = isFromGroup && 'message_thread_id' in ctx.message
+      ? (ctx.message.message_thread_id as number | undefined)
+      : undefined;
+    const replyOpts = threadId ? { message_thread_id: threadId } : {};
+
+    if (!currentApi) {
+      await ctx.telegram.sendMessage(targetChatId, '❌ Zalo chưa kết nối', replyOpts);
+      return;
+    }
+
+    try {
+      const dashboard = await buildUnreadDashboard(currentApi);
+      await ctx.telegram.sendMessage(
+        targetChatId,
+        dashboard.text,
+        {
+          ...replyOpts,
+          parse_mode: 'HTML',
+          reply_markup: dashboard.replyMarkup,
+        },
+      );
+    } catch (err) {
+      console.error('[/unread]', err);
+      await ctx.telegram.sendMessage(
+        targetChatId,
+        `❌ Không thể tải danh sách unread: ${escapeHtml(err instanceof Error ? err.message : String(err))}`,
+        { ...replyOpts, parse_mode: 'HTML' },
+      );
+    }
   });
 
   tgBot.command('open_phone', async (ctx) => {
@@ -1120,11 +1484,21 @@ export function setupTelegramHandler(
         accountLine = '\n👤 Zalo: đã kết nối 🟢';
       }
     }
+
+    let localApiSection = '';
+    if (config.telegram.localServer) {
+      const apiDetail = await getLocalApiStatus(config.telegram.localServer).catch(() => '❓ Không kiểm tra được');
+      localApiSection = `\n\n🤖 <b>Local Bot API</b> (<code>${config.telegram.localServer}</code>)\n${apiDetail}`;
+    } else {
+      localApiSection = '\n\n🌐 <b>Bot API</b>: official <code>api.telegram.org</code> (50 MB limit)';
+    }
+
     await ctx.telegram.sendMessage(
       config.telegram.groupId,
       `📊 <b>Trạng thái Bridge</b>${accountLine}\n` +
       `⏱ Uptime: <code>${uptimeStr}</code>\n` +
-      `📌 Topics: <b>${all.length}</b> (${groupCount} nhóm, ${dmCount} DM)`,
+      `📌 Topics: <b>${all.length}</b> (${groupCount} nhóm, ${dmCount} DM)` +
+      localApiSection,
       { ...replyOpts, parse_mode: 'HTML' },
     );
   });
@@ -1145,6 +1519,25 @@ export function setupTelegramHandler(
       } catch (err) {
         console.error('[TG→Zalo] lock_poll callback error:', err);
         try { await ctx.answerCbQuery('❌ Lỗi khoá bình chọn'); } catch { /* ignore */ }
+      }
+      return;
+    }
+
+    if (data === 'ur:refresh') {
+      if (!currentApi) {
+        await ctx.answerCbQuery('❌ Zalo chưa kết nối');
+        return;
+      }
+      try {
+        const dashboard = await buildUnreadDashboard(currentApi);
+        await ctx.answerCbQuery('🔄 Đã làm mới');
+        await ctx.editMessageText(dashboard.text, {
+          parse_mode: 'HTML',
+          reply_markup: dashboard.replyMarkup,
+        });
+      } catch (err) {
+        console.error('[cb/ur]', err);
+        await ctx.answerCbQuery('❌ Không thể làm mới');
       }
       return;
     }
@@ -1314,13 +1707,24 @@ export function setupTelegramHandler(
     // Resolve display name
     let displayName: string | undefined;
     if (!isGroup) {
-      displayName = friendsCache.search('', 0).find(f => f.userId === entityId)?.displayName;
+      const cachedFriend = friendsCache.getByUserId(entityId);
+      const realNameFromCache = cachedFriend?.displayName?.trim();
+      if (realNameFromCache) {
+        displayName = preferredDmTopicName(entityId, realNameFromCache);
+      }
       if (!displayName) {
         try {
           const resp = await currentApi?.getUserInfo(entityId) as {
-            changed_profiles?: Record<string, { displayName?: string }>;
+            changed_profiles?: Record<string, { displayName?: string; zaloName?: string }>;
+            unchanged_profiles?: Record<string, { displayName?: string; zaloName?: string }>;
           } | undefined;
-          displayName = resp?.changed_profiles?.[entityId]?.displayName;
+          const uidKey = entityId.includes('_') ? entityId : `${entityId}_0`;
+          const profile = resp?.changed_profiles?.[uidKey]
+            ?? resp?.changed_profiles?.[entityId]
+            ?? resp?.unchanged_profiles?.[uidKey]
+            ?? resp?.unchanged_profiles?.[entityId];
+          const realName = profile?.displayName?.trim() || profile?.zaloName?.trim();
+          if (realName) displayName = preferredDmTopicName(entityId, realName);
         } catch { /* ignore */ }
       }
       if (!displayName) displayName = `Zalo ${entityId}`;
@@ -1462,6 +1866,7 @@ export function setupTelegramHandler(
         reactionEchoStore.cancel(quote.zaloId, quote.msgId, zaloIcon);
         throw err;
       }
+      unreadState.clear(quote.zaloId, quote.threadType);
       console.log(`[TG→Zalo] Reaction "${tgEmoji}" → Zalo "${zaloIcon}" on msg ${quote.msgId}`);
     } catch (err) {
       console.error('[TG→Zalo] Reaction error:', err);
@@ -1952,7 +2357,11 @@ export function setupTelegramHandler(
             gifPath  = await convertWebmToGif(webmPath);
             sentMsgStore.markSending(zaloId);
             try {
-              await api.sendMessage({ msg: '', attachments: [gifPath] }, zaloId, threadType);
+              const sendResult = await api.sendMessage({ msg: '', attachments: [gifPath] }, zaloId, threadType);
+              const zaloMsgId = extractZaloSentMsgId(sendResult);
+              if (zaloMsgId !== undefined) {
+                sentMsgStore.save(msg.message_id, { msgId: zaloMsgId, zaloId, threadType });
+              }
             } finally {
               sentMsgStore.unmarkSending(zaloId);
             }
@@ -1975,7 +2384,11 @@ export function setupTelegramHandler(
             gifPath = await convertTgsToGif(tgsPath);
             sentMsgStore.markSending(zaloId);
             try {
-              await api.sendMessage({ msg: '', attachments: [gifPath] }, zaloId, threadType);
+              const sendResult = await api.sendMessage({ msg: '', attachments: [gifPath] }, zaloId, threadType);
+              const zaloMsgId = extractZaloSentMsgId(sendResult);
+              if (zaloMsgId !== undefined) {
+                sentMsgStore.save(msg.message_id, { msgId: zaloMsgId, zaloId, threadType });
+              }
             } finally {
               sentMsgStore.unmarkSending(zaloId);
             }

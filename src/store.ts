@@ -404,14 +404,17 @@ export const msgStore = {
   },
 };
 
-// ── User cache (in-memory, not persisted) ─────────────────────────────────────
+// ── User cache (persisted to disk, gzip compact) ──────────────────────────────
+//
+// On-disk format (user-cache.json.gz):
+//   { "u": {"uid":"name",...}, "g": {"groupId":{"normName":"uid",...},...} }
 
 /**
  * Lightweight cache of Zalo uid ↔ display name.
  * Populated automatically as messages arrive; used to resolve TG @mention text
  * back to a Zalo UID when forwarding TG → Zalo.
  */
-const USER_CACHE_MAX = 500;
+const USER_CACHE_MAX = 5000;
 const _uidToName     = new Map<string, string>();
 const _normToUid     = new Map<string, string>();
 /** zaloId → (normalizedName → uid) — collision-safe per-group lookup */
@@ -421,10 +424,64 @@ function _normName(name: string): string {
   return name.toLowerCase().trim().replace(/\s+/g, ' ');
 }
 
+const _userCacheFile = path.resolve(config.dataDir, 'user-cache.json.gz');
+
+interface UserCacheDisk {
+  u: Record<string, string>;
+  g: Record<string, Record<string, string>>;
+}
+
+function _loadUserCache(): void {
+  if (!existsSync(_userCacheFile)) return;
+  try {
+    const raw = JSON.parse(gunzipSync(readFileSync(_userCacheFile)).toString('utf8')) as UserCacheDisk;
+    for (const [uid, name] of Object.entries(raw.u ?? {})) {
+      _uidToName.set(uid, name);
+      _normToUid.set(_normName(name), uid);
+    }
+    for (const [gid, members] of Object.entries(raw.g ?? {})) {
+      const scoped = new Map<string, string>();
+      for (const [norm, uid] of Object.entries(members)) scoped.set(norm, uid);
+      _groupNameToUid.set(gid, scoped);
+    }
+    console.log(`[userCache] Loaded ${_uidToName.size} users from disk`);
+  } catch (err) {
+    console.warn('[userCache] Failed to load cache:', err);
+  }
+}
+
+let _userCacheDirty = false;
+let _userCacheTimer: ReturnType<typeof setTimeout> | null = null;
+
+function _scheduleUserCachePersist(): void {
+  _userCacheDirty = true;
+  if (_userCacheTimer) return;
+  _userCacheTimer = setTimeout(() => {
+    _userCacheTimer = null;
+    if (!_userCacheDirty) return;
+    _userCacheDirty = false;
+    try {
+      mkdirSync(path.dirname(_userCacheFile), { recursive: true });
+      const disk: UserCacheDisk = { u: {}, g: {} };
+      for (const [uid, name] of _uidToName) disk.u[uid] = name;
+      for (const [gid, scoped] of _groupNameToUid) {
+        const obj: Record<string, string> = {};
+        for (const [norm, uid] of scoped) obj[norm] = uid;
+        disk.g[gid] = obj;
+      }
+      writeFileSync(_userCacheFile, gzipSync(JSON.stringify(disk), { level: 9 }));
+    } catch (err) {
+      console.warn('[userCache] Failed to persist:', err);
+    }
+  }, 2000);
+}
+
+_loadUserCache();
+
 export const userCache = {
   /** Record a Zalo user seen in a received message. */
   save(uid: string, displayName: string): void {
-    if (_uidToName.size >= USER_CACHE_MAX) {
+    if (!_uidToName.has(uid) && _uidToName.size >= USER_CACHE_MAX) {
       const firstUid = _uidToName.keys().next().value;
       if (firstUid) {
         const oldName = _uidToName.get(firstUid);
@@ -434,6 +491,7 @@ export const userCache = {
     }
     _uidToName.set(uid, displayName);
     _normToUid.set(_normName(displayName), uid);
+    _scheduleUserCachePersist();
   },
 
   /** Find a Zalo UID by (normalised) display name. Used for TG→Zalo mention. */
@@ -447,6 +505,7 @@ export const userCache = {
     let m = _groupNameToUid.get(zaloId);
     if (!m) { m = new Map(); _groupNameToUid.set(zaloId, m); }
     m.set(_normName(displayName), uid);
+    _scheduleUserCachePersist();
   },
 
   /** Resolve UID by name, preferring group-specific lookup over global. */
@@ -480,12 +539,19 @@ export const aliasCache = {
     return _aliasMap.get(userId);
   },
 
+  /** Prefer alias for topic naming; fall back to the real name. */
+  preferredName(userId: string, realName: string): string {
+    const alias = _aliasMap.get(userId)?.trim();
+    if (!alias || alias === realName) return realName;
+    return alias;
+  },
+
   /**
    * Build display label: "Alias (Tên thật)" if alias differs from realName,
    * otherwise just realName.
    */
   label(userId: string, realName: string): string {
-    const alias = _aliasMap.get(userId);
+    const alias = _aliasMap.get(userId)?.trim();
     if (!alias || alias === realName) return realName;
     return `${alias} (${realName})`;
   },

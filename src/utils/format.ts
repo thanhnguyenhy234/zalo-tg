@@ -69,7 +69,7 @@ export interface ZaloStyle {
  */
 export function applyZaloMarkupHtml(
   text: string,
-  mentions?: ReadonlyArray<{ pos: number; len: number; type: number }>,
+  mentions?: ReadonlyArray<{ pos: number; len: number; type: number; label?: string }>,
   styles?: ReadonlyArray<ZaloStyle>,
 ): string {
   const opens  = new Map<number, string[]>();
@@ -100,7 +100,15 @@ export function applyZaloMarkupHtml(
     }
   }
 
-  if (opens.size === 0) return escapeHtml(text);
+  const replacements = new Map<number, { end: number; label: string }>();
+  if (mentions?.length) {
+    for (const m of mentions) {
+      if (!m.label || m.pos < 0 || m.pos >= text.length || m.len <= 0) continue;
+      replacements.set(m.pos, { end: Math.min(m.pos + m.len, text.length), label: m.label });
+    }
+  }
+
+  if (opens.size === 0 && replacements.size === 0) return escapeHtml(text);
 
   let result = '';
   for (let i = 0; i <= text.length; i++) {
@@ -109,7 +117,15 @@ export function applyZaloMarkupHtml(
     if (cls) for (const t of cls) result += `</${t}>`;
     const opn = opens.get(i);
     if (opn) for (const t of opn) result += `<${t}>`;
-    if (i < text.length) result += escapeHtml(text[i]!);
+    if (i < text.length) {
+      const replacement = replacements.get(i);
+      if (replacement) {
+        result += escapeHtml(replacement.label);
+        i = replacement.end - 1;
+      } else {
+        result += escapeHtml(text[i]!);
+      }
+    }
   }
   return result;
 }

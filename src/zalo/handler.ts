@@ -231,6 +231,12 @@ function preferredDmTopicDisplayName(zaloId: string, realName: string): string {
   return aliasCache.preferredName(zaloId, displayName);
 }
 
+function preferredGroupSenderLabel(uid: string | undefined, realName: string): string {
+  const displayName = realName.trim();
+  if (!displayName) return uid ? `Zalo ${uid}` : realName;
+  return uid ? aliasCache.preferredName(uid, displayName) : displayName;
+}
+
 async function syncTopicTitleIfNeeded(
   topicId: number,
   zaloId: string,
@@ -605,7 +611,9 @@ export async function setupZaloHandler(api: ZaloAPI): Promise<void> {
       }
 
       const topicId = await getOrCreateTopic(zaloId, type, displayName, groupAvatarUrl);
-      const senderLabel = type === ThreadType.Group ? senderName : displayName;
+      const senderLabel = type === ThreadType.Group
+        ? preferredGroupSenderLabel(msg.data.uidFrom, senderName)
+        : displayName;
 
       // Resolve Telegram reply target from incoming Zalo quote (if any)
       let tgReplyMsgId: number | undefined;
@@ -1138,7 +1146,7 @@ ${escapeHtml(photoCaption)}`
           }
 
           const header = type === ThreadType.Group
-            ? `${senderName} tạo bình chọn`
+            ? `${senderLabel} tạo bình chọn`
             : 'Bình chọn mới';
 
           const tgPollMsg = await tg.sendPoll(
@@ -1178,7 +1186,7 @@ ${escapeHtml(photoCaption)}`
           let updatedDetail = pollDetail;
           try { updatedDetail = await api.getPollDetail(pollId); } catch { /* use existing */ }
           const header = type === ThreadType.Group
-            ? `${senderName} vừa bình chọn`
+            ? `${senderLabel} vừa bình chọn`
             : 'Cập nhật bình chọn';
           const detailOptions = updatedDetail?.options ?? [];
           const scoreText = buildScoreText(
@@ -1472,7 +1480,8 @@ ${escapeHtml(photoCaption)}`
 
       const rawName = typeof data?.dName === 'string' ? data.dName.trim() : '';
       const actorUid = typeof data?.uidFrom === 'string' ? data.uidFrom : undefined;
-      const actorName = rawName || await resolveUserDisplayName(api, actorUid, 'ai đó');
+      const actorBaseName = rawName || await resolveUserDisplayName(api, actorUid, 'ai đó');
+      const actorName = actorUid ? aliasCache.preferredName(actorUid, actorBaseName) : actorBaseName;
 
       // Aggregate reactions: update the summary entry then debounce send/edit
       const entry = reactionSummaryStore.upsert(tgMsgId, emoji, actorName);

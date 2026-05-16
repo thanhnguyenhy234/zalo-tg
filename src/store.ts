@@ -593,8 +593,9 @@ export const groupsCache = {
 // ── Sent message store (TG→Zalo direction) ────────────────────────────────────
 
 export interface SentMsgInfo {
-  /** Zalo msgId returned by api.sendMessage / api.sendVoice */
-  msgId:      string | number;
+  /** Zalo msgId(s) returned by api.sendMessage / api.sendVoice.
+   *  Có thể nhiều msgId khi gửi album (mỗi file là một tin Zalo riêng). */
+  msgIds:     (string | number)[];
   /** Zalo conversation ID */
   zaloId:     string;
   /** 0 = DM, 1 = Group */
@@ -611,7 +612,9 @@ export const sentMsgStore = {
   /** Record a message we sent from TG→Zalo. tgMsgId is the user's TG message. */
   save(tgMsgId: number, info: SentMsgInfo): void {
     _sentMap.set(tgMsgId, info);
-    _sentByZaloId.set(String(info.msgId), tgMsgId);
+    for (const mid of info.msgIds) {
+      _sentByZaloId.set(String(mid), tgMsgId);
+    }
   },
 
   get(tgMsgId: number): SentMsgInfo | undefined {
@@ -643,11 +646,12 @@ export const sentMsgStore = {
 
   /**
    * Returns true if the bot is currently sending (or just finished sending within
-   * 3 s) to this zaloId — used to suppress isSelf echo in the Zalo listener.
+   * 15 s) to this zaloId — used to suppress isSelf echo in the Zalo listener.
+   * Thời gian dài để cover cả upload file chậm.
    */
   isSendingTo(zaloId: string): boolean {
     const ts = _pendingSendConvos.get(zaloId);
-    return ts !== undefined && Date.now() - ts < 3000;
+    return ts !== undefined && Date.now() - ts < 15_000;
   },
 };
 
@@ -748,6 +752,7 @@ export interface MediaGroupItem {
   fileSize?: number;
   caption?:  string;
   captionMentions?: Array<{ pos: number; uid: string; len: number }>;
+  tgMsgId?:  number;
 }
 
 interface MediaGroupBuffer {

@@ -751,13 +751,17 @@ export function setupTelegramHandler(
     const zaloThreadType = sent.threadType === 1 ? ThreadType.Group : ThreadType.User;
 
     try {
-      await currentApi.undo(
-        { msgId: sent.msgId, cliMsgId: 0 },
-        sent.zaloId,
-        zaloThreadType,
-      );
-      console.log(`[TG→Zalo] Recall msgId=${sent.msgId} zaloId=${sent.zaloId}`);
-      await ctx.reply('✅ Đã thu hồi tin nhắn trên Zalo');
+      let recalled = 0;
+      for (const mid of sent.msgIds) {
+        await currentApi.undo(
+          { msgId: mid, cliMsgId: 0 },
+          sent.zaloId,
+          zaloThreadType,
+        );
+        recalled++;
+      }
+      console.log(`[TG→Zalo] Recall ${recalled} msgIds=[${sent.msgIds}] zaloId=${sent.zaloId}`);
+      await ctx.reply(`✅ Đã thu hồi ${recalled} tin nhắn trên Zalo`);
     } catch (err) {
       console.error('[TG→Zalo] Recall error:', err);
       await ctx.reply(`❌ Thu hồi thất bại: ${err instanceof Error ? err.message : String(err)}`);
@@ -2045,7 +2049,7 @@ export function setupTelegramHandler(
           });
           const zaloMsgId = sendResult?.message?.msgId;
           if (zaloMsgId !== undefined) {
-            sentMsgStore.save(msg.message_id, { msgId: zaloMsgId, zaloId, threadType });
+            sentMsgStore.save(msg.message_id, { msgIds: [zaloMsgId], zaloId, threadType });
             // Save to msgStore so replying to this TG message creates a valid
             // Zalo quote chain. zca-js needs cliMsgId + uidFrom to match what
             // Zalo stored when the message was originally sent.
@@ -2058,7 +2062,7 @@ export function setupTelegramHandler(
               uidFrom: ownUid,
               ts: String(Math.floor(Date.now() / 1000)),
               msgType: 'webchat',
-              content: msg.text ?? '',
+            content: (msg as any).text ?? '',
               ttl: 0,
               zaloId,
               threadType: entry.type,
@@ -2180,20 +2184,20 @@ export function setupTelegramHandler(
 
           const zaloMsgId = sendResult?.message?.msgId ?? sendResult?.attachment?.[0]?.msgId;
           if (zaloMsgId !== undefined) {
-            sentMsgStore.save(msg.message_id, { msgId: zaloMsgId, zaloId, threadType });
-            const ownUid = typeof api.getOwnId === 'function' ? String(api.getOwnId()) : '';
-            msgStore.save(msg.message_id, [String(zaloMsgId)], {
-              msgId: String(zaloMsgId),
-              cliMsgId: '',
-              uidFrom: ownUid,
-              ts: String(Math.floor(Date.now() / 1000)),
-              msgType: 'webchat',
-              content: caption ?? filename ?? '',
-              ttl: 0,
-              zaloId,
-              threadType: entry.type,
-            });
-          }
+sentMsgStore.save(msg.message_id, { msgIds: [zaloMsgId], zaloId, threadType });
+          const ownUid = typeof api.getOwnId === 'function' ? String(api.getOwnId()) : '';
+          msgStore.save(msg.message_id, [String(zaloMsgId)], {
+            msgId: String(zaloMsgId),
+            cliMsgId: '',
+            uidFrom: ownUid,
+            ts: String(Math.floor(Date.now() / 1000)),
+            msgType: 'webchat',
+            content: (msg as any).text ?? '',
+            ttl: 0,
+            zaloId,
+            threadType: entry.type,
+          });
+        }
           console.log(`[TG→Zalo] Send OK: ${filename}`);
         } catch (err) {
           await notifyError(`sendAttachment(${filename})`, err);
@@ -2251,20 +2255,46 @@ export function setupTelegramHandler(
             localPaths.push(await downloadToTemp(fileLink.toString(), item.fname));
           }
           if (localPaths.length === 0) return;
-          const sendResult = await api.sendMessage(
-            {
-              msg: caption,
-              attachments: localPaths,
-              ...(zaloQuote ? { quote: zaloQuote } : {}),
-              ...(capMentions?.length ? { mentions: capMentions } : {}),
-            },
-            meta.zaloId,
-            meta.threadType === 1 ? ThreadType.Group : ThreadType.User,
-          );
-          const zaloMsgId = sendResult?.message?.msgId ?? sendResult?.attachment?.[0]?.msgId;
-          if (zaloMsgId !== undefined) {
-            // We don't have a single tgMsgId here (multiple), just skip sentMsgStore
-            console.log(`[TG→Zalo] Media group sent: ${localPaths.length} files, zaloMsgId=${zaloMsgId}`);
+          sentMsgStore.markSending(meta.zaloId);
+          try {
+            const sendResult = await api.sendMessage(
+              {
+                msg: caption,
+                attachments: localPaths,
+                ...(zaloQuote ? { quote: zaloQuote } : {}),
+                ...(capMentions?.length ? { mentions: capMentions } : {}),
+              },
+              meta.zaloId,
+              meta.threadType === 1 ? ThreadType.Group : ThreadType.User,
+            );
+            const zaloMsgIds: (string | number)[] = [];
+            if (sendResult?.message?.msgId != null) zaloMsgIds.push(sendResult.message.msgId);
+            if (sendResult?.attachment) {
+              for (const a of sendResult.attachment) {
+                if (a.msgId != null) zaloMsgIds.push(a.msgId);
+              }
+            }
+            if (zaloMsgIds.length > 0) {
+              const firstTgMsgId = items[0]?.tgMsgId;
+              if (firstTgMsgId !== undefined) {
+                sentMsgStore.save(firstTgMsgId, { msgIds: zaloMsgIds, zaloId: meta.zaloId, threadType: meta.threadType });
+                const ownUid = typeof api.getOwnId === 'function' ? String(api.getOwnId()) : '';
+                msgStore.save(firstTgMsgId, [String(zaloMsgIds[0])], {
+                  msgId: String(zaloMsgIds[0]),
+                  cliMsgId: '',
+                  uidFrom: ownUid,
+                  ts: String(Math.floor(Date.now() / 1000)),
+                  msgType: 'webchat',
+                  content: caption || 'Media group',
+                  ttl: 0,
+                  zaloId: meta.zaloId,
+                  threadType: meta.threadType,
+                });
+              }
+              console.log(`[TG→Zalo] Media group sent: ${localPaths.length} files, msgIds=[${zaloMsgIds}]`);
+            }
+          } finally {
+            sentMsgStore.unmarkSending(meta.zaloId);
           }
         } catch (err) {
           console.error('[TG→Zalo] Media group send failed:', err);
@@ -2284,7 +2314,7 @@ export function setupTelegramHandler(
           const replyToMsgId = msg.reply_to_message?.message_id;
           mediaGroupStore.add(
             mediaGroupId,
-            { fileId: photo.file_id, fname: 'photo.jpg', fileSize: photo.file_size, caption: cap, captionMentions: capMentions },
+            { fileId: photo.file_id, fname: 'photo.jpg', fileSize: photo.file_size, caption: cap, captionMentions: capMentions, tgMsgId: msg.message_id },
             { topicId, zaloId, threadType: entry.type, replyToMsgId },
             (items, meta) => { void flushMediaGroup(items, meta); },
           );
@@ -2320,7 +2350,7 @@ export function setupTelegramHandler(
           const replyToMsgId = msg.reply_to_message?.message_id;
           mediaGroupStore.add(
             mediaGroupId,
-            { fileId: vid.file_id, fname, fileSize: vid.file_size, caption: cap, captionMentions: capMentions },
+            { fileId: vid.file_id, fname, fileSize: vid.file_size, caption: cap, captionMentions: capMentions, tgMsgId: msg.message_id },
             { topicId, zaloId, threadType: entry.type, replyToMsgId },
             (items, meta) => { void flushMediaGroup(items, meta); },
           );
@@ -2384,7 +2414,19 @@ export function setupTelegramHandler(
               threadType,
             );
             if (result?.msgId !== undefined) {
-              sentMsgStore.save(msg.message_id, { msgId: result.msgId, zaloId, threadType });
+              sentMsgStore.save(msg.message_id, { msgIds: [result.msgId], zaloId, threadType });
+              const ownUid = typeof api.getOwnId === 'function' ? String(api.getOwnId()) : '';
+              msgStore.save(msg.message_id, [String(result.msgId)], {
+                msgId: String(result.msgId),
+                cliMsgId: '',
+                uidFrom: ownUid,
+                ts: String(Math.floor(Date.now() / 1000)),
+                msgType: 'webchat',
+                content: cap ?? '',
+                ttl: 0,
+                zaloId,
+                threadType: entry.type,
+              });
             }
           } finally {
             sentMsgStore.unmarkSending(zaloId);
@@ -2425,8 +2467,8 @@ export function setupTelegramHandler(
           console.log(`[TG→Zalo] Sending voice → ${voiceUrl}`);
           const voiceResult = await api.sendVoice({ voiceUrl }, zaloId, threadType) as Record<string, unknown>;
           const voiceMsgId = voiceResult?.msgId ?? (voiceResult?.message as Record<string, unknown> | undefined)?.msgId;
-          if (voiceMsgId != null) {
-            sentMsgStore.save(msg.message_id, { msgId: Number(voiceMsgId), zaloId, threadType });
+          if (voiceMsgId != null && !Number.isNaN(Number(voiceMsgId))) {
+            sentMsgStore.save(msg.message_id, { msgIds: [Number(voiceMsgId)], zaloId, threadType });
             const ownUid = typeof api.getOwnId === 'function' ? String(api.getOwnId()) : '';
             msgStore.save(msg.message_id, [String(voiceMsgId)], {
               msgId: String(voiceMsgId),
@@ -2466,7 +2508,7 @@ export function setupTelegramHandler(
               const sendResult = await api.sendMessage({ msg: '', attachments: [gifPath] }, zaloId, threadType);
               const zaloMsgId = extractZaloSentMsgId(sendResult);
               if (zaloMsgId !== undefined) {
-                sentMsgStore.save(msg.message_id, { msgId: zaloMsgId, zaloId, threadType });
+                sentMsgStore.save(msg.message_id, { msgIds: [zaloMsgId], zaloId, threadType });
               }
             } finally {
               sentMsgStore.unmarkSending(zaloId);
@@ -2609,12 +2651,18 @@ export function setupTelegramHandler(
         const locationLabel = venue?.title
           ? `📍 ${venue.title}${venue.address ? ` — ${venue.address}` : ''}\n${mapsUrl}`
           : `📍 ${mapsUrl}`;
+        sentMsgStore.markSending(zaloId);
         try {
-          // zca-js has no sendLocation — send as plain text with coords
-          await api.sendMessage({ msg: locationLabel }, zaloId, threadType);
+          const result = await api.sendMessage({ msg: locationLabel }, zaloId, threadType) as { message?: { msgId?: number } };
+          const zaloMsgId = result?.message?.msgId;
+          if (zaloMsgId !== undefined) {
+            sentMsgStore.save(msg.message_id, { msgIds: [zaloMsgId], zaloId, threadType });
+          }
           console.log(`[TG→Zalo] Location sent: ${latitude},${longitude}`);
         } catch (err) {
           console.error('[TG→Zalo] Location send error:', err);
+        } finally {
+          sentMsgStore.unmarkSending(zaloId);
         }
         return;
       }
@@ -2629,14 +2677,18 @@ export function setupTelegramHandler(
           // TG user_id is not Zalo UID, skip sendCard attempt
         }
         if (!cardSent) {
-          const body = `👤 <b>Danh thiếp</b>\nTên: <b>${fullName}</b>\nSĐT: <code>${contact.phone_number}</code>`;
+          sentMsgStore.markSending(zaloId);
           try {
-            await api.sendMessage({ msg: `👤 ${fullName} — ${contact.phone_number}` }, zaloId, threadType);
+            const result = await api.sendMessage({ msg: `👤 ${fullName} — ${contact.phone_number}` }, zaloId, threadType) as { message?: { msgId?: number } };
+            const zaloMsgId = result?.message?.msgId;
+            if (zaloMsgId !== undefined) {
+              sentMsgStore.save(msg.message_id, { msgIds: [zaloMsgId], zaloId, threadType });
+            }
           } catch (err) {
             await notifyError('sendContact', err);
+          } finally {
+            sentMsgStore.unmarkSending(zaloId);
           }
-          // Also send formatted version on TG side as confirmation (just log)
-          void body;
         }
         return;
       }

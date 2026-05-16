@@ -243,25 +243,40 @@ const _zaloToTg = new Map<string, number>();
 const _tgToQuote = new Map<number, ZaloQuoteData>();
 /** Insertion-order keys for eviction */
 const _msgKeyOrder: string[] = [];
+/** Số lượng zaloMsgId trỏ đến mỗi tgMsgId (để tránh xoá quote sớm) */
+const _tgRefCount = new Map<number, number>();
+
+function _evictOne(): void {
+  const old = _msgKeyOrder.shift();
+  if (!old) return;
+  const oldTg = _zaloToTg.get(old);
+  _zaloToTg.delete(old);
+  if (oldTg !== undefined) {
+    const remaining = (_tgRefCount.get(oldTg) ?? 1) - 1;
+    if (remaining <= 0) {
+      _tgRefCount.delete(oldTg);
+      _tgToQuote.delete(oldTg);
+    } else {
+      _tgRefCount.set(oldTg, remaining);
+    }
+  }
+}
 
 // Load persisted data immediately
 {
   const saved = _loadMsgMap();
   for (const [zaloId, tgId] of saved.pairs) {
+    if (!_zaloToTg.has(zaloId)) {
+      _msgKeyOrder.push(zaloId);
+      _tgRefCount.set(tgId, (_tgRefCount.get(tgId) ?? 0) + 1);
+    }
     _zaloToTg.set(zaloId, tgId);
-    _msgKeyOrder.push(zaloId);
   }
   for (const [tgId, quote] of saved.quotes) {
     _tgToQuote.set(tgId, quote);
   }
   // Trim if over limit (file may have grown beyond MSG_CACHE_MAX)
-  while (_msgKeyOrder.length > MSG_CACHE_MAX) {
-    const old = _msgKeyOrder.shift();
-    if (!old) break;
-    const oldTg = _zaloToTg.get(old);
-    _zaloToTg.delete(old);
-    if (oldTg !== undefined) _tgToQuote.delete(oldTg);
-  }
+  while (_msgKeyOrder.length > MSG_CACHE_MAX) _evictOne();
 }
 
 export const msgStore = {
@@ -275,16 +290,13 @@ export const msgStore = {
     // Drop sentinel "0" and empty IDs — they are realMsgId=0 placeholders,
     // nobody ever queries getTgMsgId("0") so storing them is pure waste.
     const validIds = zaloMsgIds.filter(id => id && id !== '0');
-    while (_msgKeyOrder.length + validIds.length > MSG_CACHE_MAX) {
-      const old = _msgKeyOrder.shift();
-      if (!old) break;
-      const oldTg = _zaloToTg.get(old);
-      _zaloToTg.delete(old);
-      if (oldTg !== undefined) _tgToQuote.delete(oldTg);
-    }
+    while (_msgKeyOrder.length + validIds.length > MSG_CACHE_MAX) _evictOne();
     for (const id of validIds) {
+      if (!_zaloToTg.has(id)) {
+        _tgRefCount.set(tgMsgId, (_tgRefCount.get(tgMsgId) ?? 0) + 1);
+        _msgKeyOrder.push(id);
+      }
       _zaloToTg.set(id, tgMsgId);
-      _msgKeyOrder.push(id);
     }
     _tgToQuote.set(tgMsgId, quote);
     _scheduleMsgPersist();
@@ -417,6 +429,12 @@ export const userCache = {
         const oldName = _uidToName.get(firstUid);
         _uidToName.delete(firstUid);
         if (oldName) _normToUid.delete(_normName(oldName));
+        // Xoá luôn trong _groupNameToUid để tránh rò rỉ
+        for (const [, nameMap] of _groupNameToUid) {
+          for (const [norm, uid2] of nameMap) {
+            if (uid2 === firstUid) { nameMap.delete(norm); break; }
+          }
+        }
       }
     }
     _uidToName.set(uid, displayName);
@@ -605,12 +623,30 @@ export interface SentMsgInfo {
 const _sentMap      = new Map<number, SentMsgInfo>(); // tgMsgId → info
 const _sentByZaloId = new Map<string, number>();       // String(zaloMsgId) → tgMsgId
 
+/** Insertion-order tracking for sentMap eviction (oldest first) */
+const _sentKeyOrder: number[] = [];
+const SENT_MAP_MAX = 5000;
+
 /** zaloId values currently being sent by the bot (to handle echo race condition) */
 const _pendingSendConvos = new Map<string, number>(); // zaloId → timestamp
 
 export const sentMsgStore = {
   /** Record a message we sent from TG→Zalo. tgMsgId is the user's TG message. */
   save(tgMsgId: number, info: SentMsgInfo): void {
+    // Evict oldest entry if at capacity (only count NEW tgMsgIds)
+    if (!_sentMap.has(tgMsgId)) {
+      _sentKeyOrder.push(tgMsgId);
+      while (_sentKeyOrder.length > SENT_MAP_MAX) {
+        const oldest = _sentKeyOrder.shift()!;
+        const oldInfo = _sentMap.get(oldest);
+        _sentMap.delete(oldest);
+        if (oldInfo) {
+          for (const mid of oldInfo.msgIds) {
+            _sentByZaloId.delete(String(mid));
+          }
+        }
+      }
+    }
     _sentMap.set(tgMsgId, info);
     for (const mid of info.msgIds) {
       _sentByZaloId.set(String(mid), tgMsgId);

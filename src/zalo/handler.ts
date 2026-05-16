@@ -539,7 +539,7 @@ export async function setupZaloHandler(api: ZaloAPI): Promise<void> {
 
       const zaloId     = msg.threadId;
       const type       = msg.type as 0 | 1;
-      const ownUid     = typeof api.getOwnId === 'function' ? String(api.getOwnId()) : undefined;
+      const ownUid     = String(api.getOwnId?.() ?? '');
       const senderUid  = msg.isSelf && ownUid ? ownUid : msg.data.uidFrom;
       const senderName = msg.isSelf ? 'Bạn' : (msg.data.dName ?? msg.data.uidFrom);
       const msgType    = msg.data.msgType ?? ZALO_MSG_TYPES.TEXT;
@@ -1283,7 +1283,8 @@ ${escapeHtml(photoCaption)}`
               const resp = await api.getUserInfo(uid) as {
                 changed_profiles?: Record<string, { displayName?: string }>;
               };
-              contactName = resp?.changed_profiles?.[uid]?.displayName ?? uid;
+              const uidKey = uid.includes('_') ? uid : `${uid}_0`;
+              contactName = resp?.changed_profiles?.[uidKey]?.displayName ?? uid;
               if (contactName !== uid) userCache.save(uid, contactName);
             } catch { /* non-fatal */ }
           }

@@ -63,6 +63,14 @@ export const store = {
     persist(_data);
   },
 
+  /** Update the stored display name for an existing topic mapping. */
+  updateName(topicId: number, name: string): void {
+    const entry = _data.topics[String(topicId)];
+    if (!entry || entry.name === name) return;
+    entry.name = name;
+    persist(_data);
+  },
+
   /** All entries (for diagnostics). */
   all(): TopicEntry[] {
     return Object.values(_data.topics);
@@ -139,13 +147,6 @@ type MsgMapFile = MsgMapV1 | MsgMapV2;
 interface MsgMapData {
   pairs:  [string, number][];
   quotes: [number, ZaloQuoteData][];
-}
-
-export interface MsgSearchHit {
-  tgMsgId: number;
-  quote:   ZaloQuoteData;
-  text:    string;
-  snippet: string;
 }
 
 const _msgMapFile = path.resolve(config.dataDir, 'msg-map.json');
@@ -234,80 +235,6 @@ function _scheduleMsgPersist(): void {
   }, 1000);
 }
 
-function normalizeMessageSearchValue(value: string): string {
-  return value.toLowerCase().normalize('NFD').replace(/\p{Mn}/gu, '').replace(/\s+/g, ' ').trim();
-}
-
-function buildMessageSearchSnippet(value: string, limit = 120): string {
-  const compact = value.replace(/\s+/g, ' ').trim();
-  return compact.length > limit ? `${compact.slice(0, limit - 1)}…` : compact;
-}
-
-function collectSearchableStrings(
-  value: unknown,
-  sink: string[],
-  key?: string,
-  depth = 0,
-): void {
-  if (depth > 5 || value == null) return;
-
-  if (typeof value === 'string') {
-    const trimmed = value.replace(/\s+/g, ' ').trim();
-    if (!trimmed) return;
-
-    if ((trimmed.startsWith('{') && trimmed.endsWith('}')) || (trimmed.startsWith('[') && trimmed.endsWith(']'))) {
-      try {
-        collectSearchableStrings(JSON.parse(trimmed) as unknown, sink, key, depth + 1);
-        return;
-      } catch {
-        // fall through to treat it as plain text
-      }
-    }
-
-    if (/^https?:\/\//i.test(trimmed)) return;
-
-    if (!key) {
-      sink.push(trimmed);
-      return;
-    }
-
-    const lowerKey = key.toLowerCase();
-    if (['href', 'hd', 'thumb', 'avatar', 'url', 'file', 'src', 'id', 'climsgid', 'msgid', 'uid', 'ts', 'ttl', 'params'].includes(lowerKey)) {
-      return;
-    }
-
-    if (
-      ['text', 'content', 'title', 'description', 'desc', 'caption', 'name', 'body', 'message', 'msg'].includes(lowerKey)
-      || false
-    ) {
-      sink.push(trimmed);
-      return;
-    }
-
-    if (lowerKey.endsWith('text') || lowerKey.endsWith('title') || lowerKey.endsWith('name') || lowerKey.endsWith('desc') || lowerKey.endsWith('caption')) {
-      sink.push(trimmed);
-    }
-    return;
-  }
-
-  if (Array.isArray(value)) {
-    for (const item of value) collectSearchableStrings(item, sink, key, depth + 1);
-    return;
-  }
-
-  if (typeof value === 'object') {
-    for (const [childKey, childValue] of Object.entries(value as Record<string, unknown>)) {
-      collectSearchableStrings(childValue, sink, childKey, depth + 1);
-    }
-  }
-}
-
-function extractQuoteSearchText(content: ZaloQuoteData['content']): string {
-  const values: string[] = [];
-  collectSearchableStrings(content, values);
-  return [...new Set(values)].join(' • ');
-}
-
 // ── In-memory state (pre-loaded from disk) ────────────────────────────────────
 
 /** zaloMsgId → Telegram message_id (used to find TG reply target) */
@@ -373,34 +300,16 @@ export const msgStore = {
     return _tgToQuote.get(tgMsgId);
   },
 
-  /** Search recent bridged messages by textual content stored in quote payloads. */
-  searchByContent(query: string, limit = 10): MsgSearchHit[] {
-    const normalizedQuery = normalizeMessageSearchValue(query);
-    if (!normalizedQuery) return [];
-
-    const hits: MsgSearchHit[] = [];
-    for (const [tgMsgId, quote] of [..._tgToQuote.entries()].reverse()) {
-      const text = extractQuoteSearchText(quote.content);
-      if (!text) continue;
-      if (!normalizeMessageSearchValue(text).includes(normalizedQuery)) continue;
-      hits.push({
-        tgMsgId,
-        quote,
-        text,
-        snippet: buildMessageSearchSnippet(text),
-      });
-      if (hits.length >= limit) break;
+  /**
+   * Update the cliMsgId on an existing quote entry.
+   * Used when the Zalo echo event provides the real cliMsgId after a TG→Zalo send.
+   */
+  updateQuoteCliMsgId(tgMsgId: number, cliMsgId: string): void {
+    const quote = _tgToQuote.get(tgMsgId);
+    if (quote) {
+      quote.cliMsgId = cliMsgId;
+      _scheduleMsgPersist();
     }
-    return hits;
-  },
-
-  /** Count how many cached messages currently have searchable text. */
-  getSearchableCount(): number {
-    let count = 0;
-    for (const quote of _tgToQuote.values()) {
-      if (extractQuoteSearchText(quote.content)) count += 1;
-    }
-    return count;
   },
 };
 
@@ -408,26 +317,43 @@ export const msgStore = {
 //
 // On-disk format (user-cache.json.gz):
 //   { "u": {"uid":"name",...}, "g": {"groupId":{"normName":"uid",...},...} }
+//
+// Techniques for minimum file size + maximum read speed:
+//   • Flat objects (no per-entry field names) → uid/name stored once
+//   • normName pre-computed at write → O(1) Map lookup at read, no re-normalize
+//   • gzip level 9 → ~70% smaller (Vietnamese names compress extremely well)
+//   • Debounced write (2 s) → batches rapid saves into one write
+//   • In-memory Maps → all gets are O(1), disk only read on startup
 
 /**
  * Lightweight cache of Zalo uid ↔ display name.
  * Populated automatically as messages arrive; used to resolve TG @mention text
  * back to a Zalo UID when forwarding TG → Zalo.
  */
-const USER_CACHE_MAX = 5000;
-const _uidToName     = new Map<string, string>();
-const _normToUid     = new Map<string, string>();
+const USER_CACHE_MAX  = 5000;
+const _uidToName      = new Map<string, string>();
+const _normToUid      = new Map<string, string>();
 /** zaloId → (normalizedName → uid) — collision-safe per-group lookup */
 const _groupNameToUid = new Map<string, Map<string, string>>();
 
 function _normName(name: string): string {
-  return name.toLowerCase().trim().replace(/\s+/g, ' ');
+  return name
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/\p{Mn}/gu, '')
+    .replace(/đ/g, 'd')
+    .replace(/\s+/g, ' ')
+    .trim();
 }
+
+// ── Persistence helpers ───────────────────────────────────────────────────────
 
 const _userCacheFile = path.resolve(config.dataDir, 'user-cache.json.gz');
 
 interface UserCacheDisk {
+  /** uid → displayName */
   u: Record<string, string>;
+  /** groupId → { normName → uid } */
   g: Record<string, Record<string, string>>;
 }
 
@@ -440,17 +366,17 @@ function _loadUserCache(): void {
       _normToUid.set(_normName(name), uid);
     }
     for (const [gid, members] of Object.entries(raw.g ?? {})) {
-      const scoped = new Map<string, string>();
-      for (const [norm, uid] of Object.entries(members)) scoped.set(norm, uid);
-      _groupNameToUid.set(gid, scoped);
+      const m = new Map<string, string>();
+      for (const [norm, uid] of Object.entries(members)) m.set(norm, uid);
+      _groupNameToUid.set(gid, m);
     }
     console.log(`[userCache] Loaded ${_uidToName.size} users from disk`);
-  } catch (err) {
-    console.warn('[userCache] Failed to load cache:', err);
+  } catch (e) {
+    console.warn('[userCache] Failed to load cache:', e);
   }
 }
 
-let _userCacheDirty = false;
+let _userCacheDirty  = false;
 let _userCacheTimer: ReturnType<typeof setTimeout> | null = null;
 
 function _scheduleUserCachePersist(): void {
@@ -464,23 +390,27 @@ function _scheduleUserCachePersist(): void {
       mkdirSync(path.dirname(_userCacheFile), { recursive: true });
       const disk: UserCacheDisk = { u: {}, g: {} };
       for (const [uid, name] of _uidToName) disk.u[uid] = name;
-      for (const [gid, scoped] of _groupNameToUid) {
+      for (const [gid, m] of _groupNameToUid) {
         const obj: Record<string, string> = {};
-        for (const [norm, uid] of scoped) obj[norm] = uid;
+        for (const [norm, uid] of m) obj[norm] = uid;
         disk.g[gid] = obj;
       }
       writeFileSync(_userCacheFile, gzipSync(JSON.stringify(disk), { level: 9 }));
-    } catch (err) {
-      console.warn('[userCache] Failed to persist:', err);
+    } catch (e) {
+      console.warn('[userCache] Failed to persist:', e);
     }
   }, 2000);
 }
 
+// Load from disk on startup
 _loadUserCache();
+
+// ── Public API ────────────────────────────────────────────────────────────────
 
 export const userCache = {
   /** Record a Zalo user seen in a received message. */
   save(uid: string, displayName: string): void {
+    // Evict oldest only if new uid (avoid eviction on name update)
     if (!_uidToName.has(uid) && _uidToName.size >= USER_CACHE_MAX) {
       const firstUid = _uidToName.keys().next().value;
       if (firstUid) {
@@ -505,7 +435,7 @@ export const userCache = {
     let m = _groupNameToUid.get(zaloId);
     if (!m) { m = new Map(); _groupNameToUid.set(zaloId, m); }
     m.set(_normName(displayName), uid);
-    _scheduleUserCachePersist();
+    // persist already scheduled by save()
   },
 
   /** Resolve UID by name, preferring group-specific lookup over global. */
@@ -532,12 +462,23 @@ export const aliasCache = {
   setAll(items: Array<{ userId: string; alias: string }>): void {
     _aliasMap.clear();
     _aliasNormToUid.clear();
-    for (const { userId, alias } of items) {
-      if (alias?.trim()) {
-        _aliasMap.set(userId, alias.trim());
-        _aliasNormToUid.set(_normName(alias), userId);
+    this.merge(items);
+  },
+
+  /** Merge aliases/contact display names into the existing cache. */
+  merge(items: Array<{ userId: string; alias?: string; displayName?: string }>): void {
+    for (const { userId, alias, displayName } of items) {
+      const name = (alias ?? displayName)?.trim();
+      if (name) {
+        _aliasMap.set(userId, name);
+        _aliasNormToUid.set(_normName(name), userId);
       }
     }
+  },
+
+  /** Number of cached contact display names / aliases. */
+  size(): number {
+    return _aliasMap.size;
   },
 
   /** Find a Zalo UID by alias name (for TG→Zalo mention via alias). */
@@ -550,19 +491,12 @@ export const aliasCache = {
     return _aliasMap.get(userId);
   },
 
-  /** Prefer alias for topic naming; fall back to the real name. */
-  preferredName(userId: string, realName: string): string {
-    const alias = _aliasMap.get(userId)?.trim();
-    if (!alias || alias === realName) return realName;
-    return alias;
-  },
-
   /**
    * Build display label: "Alias (Tên thật)" if alias differs from realName,
    * otherwise just realName.
    */
   label(userId: string, realName: string): string {
-    const alias = _aliasMap.get(userId)?.trim();
+    const alias = _aliasMap.get(userId);
     if (!alias || alias === realName) return realName;
     return `${alias} (${realName})`;
   },
@@ -577,55 +511,49 @@ export interface ZaloFriend {
   alias?:      string;
 }
 
+function upsertAliasFromFriend(friend: ZaloFriend): void {
+  const preferredName = friend.alias?.trim() || friend.displayName?.trim();
+  if (!preferredName) return;
+  _aliasMap.set(friend.userId, preferredName);
+  _aliasNormToUid.set(_normName(preferredName), friend.userId);
+}
+
 const FRIENDS_TTL_MS = 5 * 60 * 1000; // 5 minutes
 
 let _friends:    ZaloFriend[] = [];
 let _friendsTs:  number       = 0;
-
-function normalizeFriendSearchValue(value: string): string {
-  return value.toLowerCase().normalize('NFD').replace(/\p{Mn}/gu, '').trim();
-}
-
-function rankFriendSearchMatch(friend: ZaloFriend, query: string): number {
-  const alias = normalizeFriendSearchValue(friend.alias ?? '');
-  const name  = normalizeFriendSearchValue(friend.displayName);
-
-  if (alias && alias === query)         return 600;
-  if (alias && alias.startsWith(query)) return 500;
-  if (alias && alias.includes(query))   return 400;
-  if (name === query)                   return 300;
-  if (name.startsWith(query))           return 200;
-  if (name.includes(query))             return 100;
-  return -1;
-}
 
 export const friendsCache = {
   /** Store a fresh friends list. */
   set(list: ZaloFriend[]): void {
     _friends   = list;
     _friendsTs = Date.now();
+    for (const friend of list) upsertAliasFromFriend(friend);
   },
 
-  getByUserId(userId: string): ZaloFriend | undefined {
-    return _friends.find(friend => friend.userId === userId);
-  },
-
-  /** Search by alias first, then real name (case/diacritic-insensitive). */
+  /**
+   * Search by substring (case/diacritic-insensitive).
+   * Searches alias first, falls back to displayName.
+   * Returns up to `limit` results.
+   */
   search(query: string, limit = 10): ZaloFriend[] {
-    const q = normalizeFriendSearchValue(query);
-    if (!q) return [];
-
+    const q = query.toLowerCase().normalize('NFD').replace(/\p{Mn}/gu, '');
     return _friends
-      .map((friend, index) => ({ friend, index, score: rankFriendSearchMatch(friend, q) }))
-      .filter((entry) => entry.score >= 0)
-      .sort((a, b) => b.score - a.score || a.index - b.index)
-      .slice(0, limit)
-      .map((entry) => entry.friend);
+      .filter(f => {
+        const searchName = (f.alias || f.displayName).toLowerCase().normalize('NFD').replace(/\p{Mn}/gu, '');
+        const realName   = f.displayName.toLowerCase().normalize('NFD').replace(/\p{Mn}/gu, '');
+        return searchName.includes(q) || realName.includes(q);
+      })
+      .slice(0, limit);
   },
 
   /** True if the cache is still fresh. */
   isFresh(): boolean {
     return _friends.length > 0 && Date.now() - _friendsTs < FRIENDS_TTL_MS;
+  },
+
+  get(userId: string): ZaloFriend | undefined {
+    return _friends.find(f => f.userId === userId);
   },
 };
 
@@ -673,10 +601,8 @@ export interface SentMsgInfo {
   threadType: 0 | 1;
 }
 
-const SENT_MAX = 300;
 const _sentMap      = new Map<number, SentMsgInfo>(); // tgMsgId → info
 const _sentByZaloId = new Map<string, number>();       // String(zaloMsgId) → tgMsgId
-const _sentOrder: number[] = [];
 
 /** zaloId values currently being sent by the bot (to handle echo race condition) */
 const _pendingSendConvos = new Map<string, number>(); // zaloId → timestamp
@@ -684,17 +610,8 @@ const _pendingSendConvos = new Map<string, number>(); // zaloId → timestamp
 export const sentMsgStore = {
   /** Record a message we sent from TG→Zalo. tgMsgId is the user's TG message. */
   save(tgMsgId: number, info: SentMsgInfo): void {
-    if (_sentOrder.length >= SENT_MAX) {
-      const old = _sentOrder.shift();
-      if (old !== undefined) {
-        const oldInfo = _sentMap.get(old);
-        if (oldInfo) _sentByZaloId.delete(String(oldInfo.msgId));
-        _sentMap.delete(old);
-      }
-    }
     _sentMap.set(tgMsgId, info);
     _sentByZaloId.set(String(info.msgId), tgMsgId);
-    _sentOrder.push(tgMsgId);
   },
 
   get(tgMsgId: number): SentMsgInfo | undefined {

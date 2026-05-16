@@ -6,7 +6,7 @@ import { execFile } from 'child_process';
 import { promisify } from 'util';
 
 import type { ZaloAPI } from '../zalo/types.js';
-import { store, msgStore, userCache, friendsCache, groupsCache, sentMsgStore, pollStore, mediaGroupStore, reactionEchoStore, aliasCache } from '../store.js';
+import { store, msgStore, userCache, friendsCache, groupsCache, sentMsgStore, pollStore, mediaGroupStore, reactionEchoStore, aliasCache, type ZaloQuoteData } from '../store.js';
 import { tgBot } from './bot.js';
 import { config } from '../config.js';
 import { unreadState } from '../unread-state.js';
@@ -1911,6 +1911,28 @@ export function setupTelegramHandler(
     }
   });
 
+  /**
+   * Look up Zalo quote data for a TG reply chain.
+   * Tries msgStore first (for Zalo→TG and TG→Zalo text messages).
+   * Only returns a quote if cliMsgId has been confirmed by the Zalo echo
+   * (non-empty, non-"0") — otherwise Zalo rejects with code 114.
+   */
+  function getZaloQuote(tgMsgId: number | undefined): ZaloQuoteData | undefined {
+    if (tgMsgId === undefined) return undefined;
+    const fromMsgStore = msgStore.getQuote(tgMsgId);
+    if (fromMsgStore) {
+      // cliMsgId is empty/"0" while waiting for the Zalo echo to confirm it
+      if (!fromMsgStore.cliMsgId || fromMsgStore.cliMsgId === '0') {
+        console.log(`[TG→Zalo] getZaloQuote: found in msgStore but cliMsgId not yet confirmed (${fromMsgStore.cliMsgId}) — skipping quote for tgMsgId=${tgMsgId}`);
+        return undefined;
+      }
+      console.log(`[TG→Zalo] getZaloQuote: found in msgStore for tgMsgId=${tgMsgId} msgId=${fromMsgStore.msgId} cliMsgId=${fromMsgStore.cliMsgId}`);
+      return fromMsgStore;
+    }
+    console.log(`[TG→Zalo] getZaloQuote: no quote found for tgMsgId=${tgMsgId}`);
+    return undefined;
+  }
+
   tgBot.on('message', async (ctx) => {
     try {
       const msg = ctx.message;
@@ -1972,9 +1994,10 @@ export function setupTelegramHandler(
         // Skip bot commands that were already handled above
         if (msg.text.startsWith('/')) return;
         console.log(`[TG→Zalo] sendMessage → zaloId=${zaloId} type=${threadType} text="${msg.text.slice(0, 80)}"`);
-        // Look up Zalo quote data if this TG message is a reply
+        // Look up Zalo quote data if this TG message is a reply.
+        // Tries msgStore (Zalo→TG) first, then sentMsgStore (TG→Zalo).
         const replyToMsgId = msg.reply_to_message?.message_id;
-        const zaloQuote = replyToMsgId !== undefined ? msgStore.getQuote(replyToMsgId) : undefined;
+        const zaloQuote = getZaloQuote(replyToMsgId);
 
         const _rawTextMentions = resolveTgMentions(
           msg.text,
@@ -2023,6 +2046,23 @@ export function setupTelegramHandler(
           const zaloMsgId = sendResult?.message?.msgId;
           if (zaloMsgId !== undefined) {
             sentMsgStore.save(msg.message_id, { msgId: zaloMsgId, zaloId, threadType });
+            // Save to msgStore so replying to this TG message creates a valid
+            // Zalo quote chain. zca-js needs cliMsgId + uidFrom to match what
+            // Zalo stored when the message was originally sent.
+            const zaloCliMsgId = sendResult?.message?.cliMsgId;
+            const ownUid = typeof api.getOwnId === 'function' ? String(api.getOwnId()) : '';
+            console.log(`[TG→Zalo] msgStore.save for tgMsgId=${msg.message_id} msgId=${zaloMsgId} ownUid=${ownUid}`);
+            msgStore.save(msg.message_id, [String(zaloMsgId)], {
+              msgId: String(zaloMsgId),
+              cliMsgId: '',
+              uidFrom: ownUid,
+              ts: String(Math.floor(Date.now() / 1000)),
+              msgType: 'webchat',
+              content: msg.text ?? '',
+              ttl: 0,
+              zaloId,
+              threadType: entry.type,
+            });
           }
         } catch (err) {
           await notifyError('sendMessage', err);
@@ -2061,7 +2101,7 @@ export function setupTelegramHandler(
         const replyToMsgId = 'reply_to_message' in msg
           ? (msg as { reply_to_message?: { message_id: number } }).reply_to_message?.message_id
           : undefined;
-        const zaloQuote = replyToMsgId !== undefined ? msgStore.getQuote(replyToMsgId) : undefined;
+        const zaloQuote = getZaloQuote(replyToMsgId);
         let fileLink: URL;
         try {
           fileLink = await ctx.telegram.getFileLink(fileId);
@@ -2141,6 +2181,18 @@ export function setupTelegramHandler(
           const zaloMsgId = sendResult?.message?.msgId ?? sendResult?.attachment?.[0]?.msgId;
           if (zaloMsgId !== undefined) {
             sentMsgStore.save(msg.message_id, { msgId: zaloMsgId, zaloId, threadType });
+            const ownUid = typeof api.getOwnId === 'function' ? String(api.getOwnId()) : '';
+            msgStore.save(msg.message_id, [String(zaloMsgId)], {
+              msgId: String(zaloMsgId),
+              cliMsgId: '',
+              uidFrom: ownUid,
+              ts: String(Math.floor(Date.now() / 1000)),
+              msgType: 'webchat',
+              content: caption ?? filename ?? '',
+              ttl: 0,
+              zaloId,
+              threadType: entry.type,
+            });
           }
           console.log(`[TG→Zalo] Send OK: ${filename}`);
         } catch (err) {
@@ -2186,7 +2238,7 @@ export function setupTelegramHandler(
         meta: { topicId: number; zaloId: string; threadType: 0 | 1; replyToMsgId?: number },
       ) => {
         const replyMsgId = meta.replyToMsgId;
-        const zaloQuote = replyMsgId !== undefined ? msgStore.getQuote(replyMsgId) : undefined;
+        const zaloQuote = getZaloQuote(replyMsgId);
         const caption = items[0]?.caption ?? '';
         const capMentions = items[0]?.captionMentions;
         const localPaths: string[] = [];
@@ -2371,7 +2423,23 @@ export function setupTelegramHandler(
           const voiceUrl = uploaded[0]?.fileUrl;
           if (!voiceUrl) throw new Error('No fileUrl from uploadAttachment');
           console.log(`[TG→Zalo] Sending voice → ${voiceUrl}`);
-          await api.sendVoice({ voiceUrl }, zaloId, threadType);
+          const voiceResult = await api.sendVoice({ voiceUrl }, zaloId, threadType) as Record<string, unknown>;
+          const voiceMsgId = voiceResult?.msgId ?? (voiceResult?.message as Record<string, unknown> | undefined)?.msgId;
+          if (voiceMsgId != null) {
+            sentMsgStore.save(msg.message_id, { msgId: Number(voiceMsgId), zaloId, threadType });
+            const ownUid = typeof api.getOwnId === 'function' ? String(api.getOwnId()) : '';
+            msgStore.save(msg.message_id, [String(voiceMsgId)], {
+              msgId: String(voiceMsgId),
+              cliMsgId: '',
+              uidFrom: ownUid,
+              ts: String(Math.floor(Date.now() / 1000)),
+              msgType: 'webchat',
+              content: '[Voice]',
+              ttl: 0,
+              zaloId,
+              threadType: entry.type,
+            });
+          }
           console.log(`[TG→Zalo] Voice sent OK`);
         } catch (err) {
           console.error('[TG→Zalo] Voice convert/send failed, falling back to file:', err);

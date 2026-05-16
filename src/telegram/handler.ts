@@ -1771,7 +1771,7 @@ export function setupTelegramHandler(
       }
       if (!displayName) displayName = `Zalo ${entityId}`;
     } else {
-      displayName = groupsCache.search('', 0).find(g => g.groupId === entityId)?.name;
+      displayName = groupsCache.search('', Number.MAX_SAFE_INTEGER).find(g => g.groupId === entityId)?.name;
       if (!displayName) {
         try {
           const info = await currentApi?.getGroupInfo(entityId) as {
@@ -2281,8 +2281,8 @@ sentMsgStore.save(msg.message_id, { msgIds: [zaloMsgId], zaloId, threadType });
               const attStartIdx = sendResult?.message?.msgId != null ? 1 : 0;
               for (let i = 0; i < downloadedTgIds.length; i++) {
                 const tgId = downloadedTgIds[i];
+                const msgIdForItem = zaloMsgIds[Math.min(attStartIdx + i, zaloMsgIds.length - 1)] ?? zaloMsgIds[0] ?? '';
                 sentMsgStore.save(tgId, { msgIds: zaloMsgIds, zaloId: meta.zaloId, threadType: meta.threadType });
-                const msgIdForItem = zaloMsgIds[attStartIdx + i] ?? zaloMsgIds[0] ?? '';
                 msgStore.save(tgId, [String(msgIdForItem)], {
                   msgId: String(msgIdForItem),
                   cliMsgId: '',

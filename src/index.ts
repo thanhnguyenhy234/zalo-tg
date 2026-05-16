@@ -130,10 +130,10 @@ async function main(): Promise<void> {
   console.log('[Boot] Bridge is running 🚀  (Ctrl+C to stop)');
 
   // ── Graceful shutdown ──────────────────────────────────────────────────────
-  const shutdown = (signal: string) => {
+  const shutdown = async (signal: string) => {
     console.log(`\n[Boot] Received ${signal}, shutting down...`);
-    try { getZaloApi().then(api => api.listener.stop()).catch(() => undefined); } catch { /* ignore */ }
-    tgBot.stop(signal);
+    try { const api = await getZaloApi(); api.listener.stop(); } catch { /* ignore */ }
+    await tgBot.stop(signal);
     process.exit(0);
   };
 

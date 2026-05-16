@@ -540,7 +540,7 @@ export async function setupZaloHandler(api: ZaloAPI): Promise<void> {
       const zaloId     = msg.threadId;
       const type       = msg.type as 0 | 1;
       const ownUid     = String(api.getOwnId?.() ?? '');
-      const senderUid  = msg.isSelf && ownUid ? ownUid : msg.data.uidFrom;
+      const senderUid  = msg.isSelf && ownUid ? ownUid : (msg.data.uidFrom ?? '');
       const senderName = msg.isSelf ? 'Bạn' : (msg.data.dName ?? msg.data.uidFrom);
       const msgType    = msg.data.msgType ?? ZALO_MSG_TYPES.TEXT;
 
@@ -603,9 +603,9 @@ export async function setupZaloHandler(api: ZaloAPI): Promise<void> {
       // Keep userCache up-to-date so TG→Zalo mention resolution works.
       // Use the resolved bridgeSenderName rather than the raw senderName (dName)
       // to avoid caching metadata-like values (e.g. "My Documents").
-      if (type === ThreadType.Group) {
+      if (type === ThreadType.Group && senderUid) {
         userCache.saveForGroup(senderUid, bridgeSenderName, zaloId);
-      } else {
+      } else if (senderUid) {
         userCache.save(senderUid, bridgeSenderName);
       }
 

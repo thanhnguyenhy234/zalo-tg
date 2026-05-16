@@ -558,7 +558,7 @@ export const friendsCache = {
     const q = query.toLowerCase().normalize('NFD').replace(/\p{Mn}/gu, '');
     return _friends
       .filter(f => {
-        const searchName = (f.alias || f.displayName).toLowerCase().normalize('NFD').replace(/\p{Mn}/gu, '');
+        const searchName = (f.alias || f.displayName || '').toLowerCase().normalize('NFD').replace(/\p{Mn}/gu, '');
         const realName   = f.displayName.toLowerCase().normalize('NFD').replace(/\p{Mn}/gu, '');
         return searchName.includes(q) || realName.includes(q);
       })
@@ -706,6 +706,14 @@ const _reactionSummaries = new Map<number, ReactionSummaryEntry>(); // tgMsgId â
 export const reactionSummaryStore = {
   /** Add or update a reaction. Returns the entry for this tgMsgId. */
   upsert(tgMsgId: number, emoji: string, actorName: string): ReactionSummaryEntry {
+    if (_reactionSummaries.size >= 500) {
+      const toDelete: number[] = [];
+      for (const [id, e] of _reactionSummaries) {
+        if (e.debounceTimer === null && e.summaryTgMsgId !== null) toDelete.push(id);
+        if (toDelete.length >= 250) break;
+      }
+      for (const id of toDelete) _reactionSummaries.delete(id);
+    }
     let entry = _reactionSummaries.get(tgMsgId);
     if (!entry) {
       entry = { summaryTgMsgId: null, lastSentText: '', reactions: {}, debounceTimer: null };

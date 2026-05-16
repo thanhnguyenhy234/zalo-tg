@@ -6,7 +6,7 @@ import { execFile } from 'child_process';
 import { promisify } from 'util';
 
 import type { ZaloAPI } from '../zalo/types.js';
-import { store, msgStore, userCache, friendsCache, groupsCache, sentMsgStore, pollStore, mediaGroupStore, reactionEchoStore, aliasCache, type ZaloQuoteData } from '../store.js';
+import { store, msgStore, userCache, friendsCache, groupsCache, sentMsgStore, pollStore, mediaGroupStore, reactionEchoStore, reactionSummaryStore, aliasCache, type ZaloQuoteData } from '../store.js';
 import { tgBot } from './bot.js';
 import { config } from '../config.js';
 import { unreadState } from '../unread-state.js';
@@ -1507,7 +1507,70 @@ export function setupTelegramHandler(
       `⏱ Uptime: <code>${uptimeStr}</code>\n` +
       `📌 Topics: <b>${all.length}</b> (${groupCount} nhóm, ${dmCount} DM)` +
       localApiSection,
-      { ...replyOpts, parse_mode: 'HTML' },
+    );
+  });
+
+  // ── Admin panel ──────────────────────────────────────────────────────────
+
+  /** Reusable back-to-menu markup */
+  const adminBackMarkup = () => ({
+    inline_keyboard: [[{ text: '◀️ Quay lại', callback_data: 'admin:menu' }]],
+  });
+
+  tgBot.command('admin', async (ctx) => {
+    if (ctx.chat.id !== config.telegram.groupId) return;
+
+    // /admin lookup — reply to a message to see its mapping
+    const text = 'text' in ctx.message ? ctx.message.text ?? '' : '';
+    const parts = text.split(/\s+/);
+    if (parts.length >= 2 && parts[1] === 'lookup') {
+      const reply = 'reply_to_message' in ctx.message
+        ? (ctx.message as { reply_to_message?: { message_id: number } }).reply_to_message
+        : undefined;
+      if (!reply) {
+        await ctx.reply('ℹ️ Reply vào tin nhắn muốn tra mapping rồi gõ /admin lookup');
+        return;
+      }
+      const sent = sentMsgStore.get(reply.message_id);
+      const quote = msgStore.getQuote(reply.message_id);
+      const lines: string[] = [
+        `🔍 <b>Mapping tgMsgId=${reply.message_id}</b>`,
+        `━━━━━━━━━━━━━━━━`,
+      ];
+      if (sent) {
+        lines.push(`📤 <b>sentMsgStore</b>`);
+        lines.push(`   MsgIds: <code>[${sent.msgIds.join(', ')}]</code>`);
+        lines.push(`   ZaloId: <code>${sent.zaloId}</code>`);
+        lines.push(`   Type:   <code>${sent.threadType === 1 ? 'Group' : 'User'}</code>`);
+      } else {
+        lines.push(`📤 sentMsgStore: <i>không tìm thấy</i>`);
+      }
+      if (quote) {
+        lines.push(`💬 <b>msgStore quote</b>`);
+        lines.push(`   MsgId:    <code>${quote.msgId}</code>`);
+        lines.push(`   CliMsgId: <code>${quote.cliMsgId}</code>`);
+        lines.push(`   UidFrom:  <code>${quote.uidFrom}</code>`);
+      } else {
+        lines.push(`💬 msgStore quote: <i>không tìm thấy</i>`);
+      }
+      await ctx.reply(lines.join('\n'), {
+        parse_mode: 'HTML',
+        reply_markup: adminBackMarkup(),
+      });
+      return;
+    }
+
+    const markup = {
+      inline_keyboard: [
+        [{ text: '📊 Trạng thái', callback_data: 'admin:status' }],
+        [{ text: '🗄 Dung lượng cache', callback_data: 'admin:cache' }],
+        [{ text: '🔍 Tra mapping', callback_data: 'admin:lookup' }],
+        [{ text: '↩️ Đóng', callback_data: 'admin:close' }],
+      ],
+    };
+    await ctx.reply(
+      '🛠 <b>ADMIN PANEL</b>\nChọn một mục bên dưới:',
+      { parse_mode: 'HTML', reply_markup: markup },
     );
   });
 
@@ -1695,6 +1758,97 @@ export function setupTelegramHandler(
         } else {
           await ctx.answerCbQuery('❌ Không thể tham gia nhóm');
         }
+      }
+      return;
+    }
+
+    // ── admin: admin panel callbacks ───────────────────────────────────────
+    if (data?.startsWith('admin:')) {
+      const action = data.slice(6);
+      if (action === 'close') {
+        await ctx.deleteMessage().catch(() => undefined);
+        return;
+      }
+      if (action === 'menu') {
+        const markup = {
+          inline_keyboard: [
+            [{ text: '📊 Trạng thái', callback_data: 'admin:status' }],
+            [{ text: '🗄 Dung lượng cache', callback_data: 'admin:cache' }],
+            [{ text: '🔍 Tra mapping', callback_data: 'admin:lookup' }],
+            [{ text: '↩️ Đóng', callback_data: 'admin:close' }],
+          ],
+        };
+        await ctx.editMessageText(
+          '🛠 <b>ADMIN PANEL</b>\nChọn một mục bên dưới:',
+          { parse_mode: 'HTML', reply_markup: markup },
+        );
+        return;
+      }
+      if (action === 'status') {
+        const uptimeSec = Math.floor((Date.now() - _bridgeStartTime) / 1000);
+        const h = Math.floor(uptimeSec / 3600);
+        const m = Math.floor((uptimeSec % 3600) / 60);
+        const s = uptimeSec % 60;
+        const all = store.all();
+        const topicStats = store.stats();
+        const uptimeBar = '█'.repeat(Math.min(h, 24)) + '░'.repeat(Math.max(0, 24 - h));
+        let zaloStatus = '🔴 Chưa kết nối';
+        if (currentApi) {
+          try {
+            const info = await currentApi.fetchAccountInfo() as { profile?: { displayName?: string } };
+            zaloStatus = `🟢 ${escapeHtml(info?.profile?.displayName ?? '?')}`;
+          } catch { zaloStatus = '🟢 Đã kết nối'; }
+        }
+        const text =
+          `📊 <b>TRẠNG THÁI</b>\n` +
+          `━━━━━━━━━━━━━━━━\n` +
+          `⏱ <b>Uptime</b>\n` +
+          `   ${uptimeBar} <code>${h}g ${m}p ${s}s</code>\n` +
+          `👤 <b>Zalo</b>\n` +
+          `   ${zaloStatus}\n` +
+          `📌 <b>Topics</b>\n` +
+          `   Tổng: <b>${all.length}</b> | Nhóm: <code>${all.filter(e => e.type === 1).length}</code> | DM: <code>${all.filter(e => e.type === 0).length}</code>\n` +
+          `💾 <b>Topic file</b>\n` +
+          `   ${(topicStats.sizeBytes / 1024).toFixed(1)} KB`;
+        await ctx.editMessageText(text, { parse_mode: 'HTML', reply_markup: adminBackMarkup() });
+        return;
+      }
+      if (action === 'cache') {
+        const m = msgStore.stats();
+        const uc = userCache.stats();
+        const fc = friendsCache.stats();
+        const gc = groupsCache.stats();
+        const sm = sentMsgStore.stats();
+        const rs = reactionSummaryStore.stats();
+        const mPct = Math.round((m.cacheSize / 2000) * 100);
+        const smPct = Math.round((sm.entries / 5000) * 100);
+        const ucPct = Math.round((uc.users / 5000) * 100);
+        const mBar = '█'.repeat(Math.min(Math.round(mPct / 5), 20)) + '░'.repeat(Math.max(0, 20 - Math.round(mPct / 5)));
+        const text =
+          `🗄 <b>DUNG LƯỢNG CACHE</b>\n` +
+          `━━━━━━━━━━━━━━━━\n` +
+          `📨 <b>msgStore</b>\n` +
+          `   ${mBar} <code>${m.cacheSize}/2000</code> (${mPct}%)\n` +
+          `   Keys: <code>${m.cacheSize}</code> | Order: <code>${m.keyOrderLen}</code> | Quotes: <code>${m.quoteCount}</code>\n` +
+          `📤 <b>sentMsgStore</b>\n` +
+          `   <code>${sm.entries}/5000</code> (${smPct}%)\n` +
+          `👥 <b>userCache</b>\n` +
+          `   <code>${uc.users}/5000</code> (${ucPct}%) | Groups: <code>${uc.groups}</code>\n` +
+          `👫 <b>friendsCache</b>: <code>${fc.count}</code>\n` +
+          `🏘 <b>groupsCache</b>: <code>${gc.count}</code>\n` +
+          `❤️ <b>reactionSummaries</b>: <code>${rs.entries}</code>`;
+        await ctx.editMessageText(text, { parse_mode: 'HTML', reply_markup: adminBackMarkup() });
+        return;
+      }
+      if (action === 'lookup') {
+        await ctx.editMessageText(
+          '🔍 <b>TRA MAPPING</b>\n' +
+          '━━━━━━━━━━━━━━━━\n' +
+          'Reply vào tin nhắn cần tra rồi gõ:\n' +
+          '<code>/admin lookup</code>',
+          { parse_mode: 'HTML', reply_markup: adminBackMarkup() },
+        );
+        return;
       }
       return;
     }

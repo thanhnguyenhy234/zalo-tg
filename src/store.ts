@@ -93,6 +93,11 @@ export const store = {
   reload(): void {
     _data = load();
   },
+
+  stats(): { topics: number; sizeBytes: number } {
+    const raw = JSON.stringify(_data);
+    return { topics: Object.keys(_data.topics).length, sizeBytes: raw.length };
+  },
 };
 
 // ── Message ID mapping (in-memory, not persisted) ─────────────────────────────
@@ -396,6 +401,10 @@ export const msgStore = {
       _scheduleMsgPersist();
     }
   },
+
+  stats(): { cacheSize: number; keyOrderLen: number; quoteCount: number } {
+    return { cacheSize: _zaloToTg.size, keyOrderLen: _msgKeyOrder.length, quoteCount: _tgToQuote.size };
+  },
 };
 
 // ── User cache (persisted to disk, gzip compact) ──────────────────────────────
@@ -539,6 +548,10 @@ export const userCache = {
   getName(uid: string): string | undefined {
     return _uidToName.get(uid);
   },
+
+  stats(): { users: number; groups: number } {
+    return { users: _uidToName.size, groups: _groupNameToUid.size };
+  },
 };
 
 // ── Alias cache (danh bạ nickname) ───────────────────────────────────────────
@@ -658,6 +671,10 @@ export const friendsCache = {
   getByUserId(userId: string): ZaloFriend | undefined {
     return _friends.find(f => f.userId === userId);
   },
+
+  stats(): { count: number } {
+    return { count: _friends.length };
+  },
 };
 
 // ── Groups cache (in-memory, TTL-refreshed) ───────────────────────────────────
@@ -690,6 +707,10 @@ export const groupsCache = {
 
   isFresh(): boolean {
     return _groups.length > 0 && Date.now() - _groupsTs < GROUPS_TTL_MS;
+  },
+
+  stats(): { count: number } {
+    return { count: _groups.length };
   },
 };
 
@@ -774,6 +795,10 @@ export const sentMsgStore = {
     const ts = _pendingSendConvos.get(zaloId);
     return ts !== undefined && Date.now() - ts < 15_000;
   },
+
+  stats(): { entries: number } {
+    return { entries: _sentMap.size };
+  },
 };
 
 // ── Reaction summary store (Zalo→TG reaction aggregation) ────────────────────
@@ -814,6 +839,10 @@ export const reactionSummaryStore = {
   setSummaryMsgId(tgMsgId: number, summaryMsgId: number): void {
     const entry = _reactionSummaries.get(tgMsgId);
     if (entry) entry.summaryTgMsgId = summaryMsgId;
+  },
+
+  stats(): { entries: number } {
+    return { entries: _reactionSummaries.size };
   },
 
   buildText(entry: ReactionSummaryEntry): string {

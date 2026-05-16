@@ -14,6 +14,7 @@ const BOT_COMMANDS = [
   { command: 'message_search', description: 'Tìm nội dung trong tin đã sync gần đây' },
   { command: 'recall',         description: 'Thu hồi tin nhắn đã gửi sang Zalo' },
   { command: 'topic',          description: 'Quản lý topic: list | info | delete' },
+  { command: 'admin',          description: 'Admin panel: trạng thái, cache, tra mapping' },
   { command: 'addgroup',       description: 'Tạo nhóm Zalo mới từ topic hiện tại' },
   { command: 'addfriend',      description: 'Gửi lời mời kết bạn Zalo' },
   { command: 'friendrequests', description: 'Xem & duyệt lời mời kết bạn đang chờ' },

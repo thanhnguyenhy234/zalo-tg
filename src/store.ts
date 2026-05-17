@@ -997,7 +997,18 @@ export const zaloAlbumStore = {
     msgIds: string[],
     meta: Omit<ZaloAlbumBuffer, 'timer' | 'urls' | 'zaloMsgIds'>,
     onFlush: (buf: Omit<ZaloAlbumBuffer, 'timer'>) => void,
+    childnumber = 0,
   ): void {
+    // If a new album (childnumber==0) arrives while a buffer exists for
+    // the same key, flush the old buffer immediately to prevent album merging.
+    if (childnumber === 0) {
+      const existing = _zaloAlbumBuffers.get(key);
+      if (existing) {
+        clearTimeout(existing.timer);
+        _zaloAlbumBuffers.delete(key);
+        setImmediate(() => onFlush({ urls: existing.urls, zaloMsgIds: existing.zaloMsgIds, ...meta }));
+      }
+    }
     const existing = _zaloAlbumBuffers.get(key);
     if (existing) {
       clearTimeout(existing.timer);

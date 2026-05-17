@@ -860,6 +860,7 @@ export async function setupZaloHandler(api: ZaloAPI): Promise<void> {
           zaloMsgIds,
           { senderName: bridgeSenderName, topicId, tgBase, zaloQuote: zaloQuoteData },
           async (buf) => {
+          childnumber,
             if (buf.urls.length === 1) {
               // Single photo — reuse eagerly started download (likely already done)
               const singleUrl = buf.urls[0]!;

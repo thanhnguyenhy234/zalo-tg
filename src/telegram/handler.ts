@@ -3,6 +3,35 @@ import path from 'path';
 import { createReadStream } from 'fs';
 import { readFile, stat, open } from 'fs/promises';
 import { execFile } from 'child_process';
+
+const MAX_ZALO_TEXT_LENGTH = 2000;
+
+function splitLongText(text: string): string[] {
+  if (text.length <= MAX_ZALO_TEXT_LENGTH) return [text];
+  const chunks: string[] = [];
+  let start = 0;
+  while (start < text.length) {
+    let end = start + MAX_ZALO_TEXT_LENGTH;
+    if (end >= text.length) {
+      chunks.push(text.slice(start));
+      break;
+    }
+    // Try to break at paragraph boundary
+    const paraBreak = text.lastIndexOf('\n\n', end);
+    if (paraBreak > start) { end = paraBreak; }
+    else {
+      const lineBreak = text.lastIndexOf('\n', end);
+      if (lineBreak > start) { end = lineBreak; }
+      else {
+        const spaceBreak = text.lastIndexOf(' ', end);
+        if (spaceBreak > start) { end = spaceBreak; }
+      }
+    }
+    chunks.push(text.slice(start, end));
+    start = end;
+  }
+  return chunks;
+}
 import { promisify } from 'util';
 
 import type { ZaloAPI } from '../zalo/types.js';
@@ -2224,38 +2253,33 @@ export function setupTelegramHandler(
 
         sentMsgStore.markSending(zaloId);
         try {
-          let sendResult = await api.sendMessage(
-            {
-              msg: finalText,
-              ...(zaloQuote ? { quote: zaloQuote } : {}),
-              ...(zaloMentions.length ? { mentions: zaloMentions } : {}),
-            },
-            zaloId,
-            threadType,
-          ).catch(async (err: unknown) => {
-            // Code 114 often means the quote data is incompatible (e.g. quoting
-            // a media message whose content structure differs from what zca-js
-            // expects). Retry without the quote so the text still goes through.
-            if ((err as { code?: number })?.code === 114 && zaloQuote) {
-              console.warn('[TG→Zalo] code 114 with quote, retrying without quote');
-              return api.sendMessage(
-                {
-                  msg: finalText,
-                  ...(zaloMentions.length ? { mentions: zaloMentions } : {}),
-                },
-                zaloId,
-                threadType,
-              );
-            }
-            throw err;
-          });
-          const zaloMsgId = sendResult?.message?.msgId;
+          const chunks = splitLongText(finalText);
+          let firstResult: Awaited<ReturnType<typeof api.sendMessage>> | undefined;
+          for (let ci = 0; ci < chunks.length; ci++) {
+            const chunkText = chunks[ci]!;
+            // Adjust mentions for this chunk's offset
+            let chunkOffset = 0;
+            for (let i = 0; i < ci; i++) chunkOffset += chunks[i]!.length;
+            const chunkMentions = zaloMentions
+              .filter(m => m.pos >= chunkOffset && m.pos < chunkOffset + chunkText.length)
+              .map(m => ({ ...m, pos: m.pos - chunkOffset }));
+            const useQuote = ci === 0 ? zaloQuote : undefined;
+            const sendResult = await api.sendMessage(
+              {
+                msg: chunkText,
+                ...(useQuote ? { quote: useQuote } : {}),
+                ...(chunkMentions.length ? { mentions: chunkMentions } : {}),
+              },
+              zaloId,
+              threadType,
+            );
+            if (ci === 0) firstResult = sendResult;
+            // Space out chunks to avoid Zalo rate limiting
+            if (ci < chunks.length - 1) await new Promise(r => setTimeout(r, 500));
+          }
+          const zaloMsgId = firstResult?.message?.msgId;
           if (zaloMsgId !== undefined) {
             sentMsgStore.save(msg.message_id, { msgIds: [zaloMsgId], zaloId, threadType });
-            // Save to msgStore so replying to this TG message creates a valid
-            // Zalo quote chain. zca-js needs cliMsgId + uidFrom to match what
-            // Zalo stored when the message was originally sent.
-            const zaloCliMsgId = sendResult?.message?.cliMsgId;
             const ownUid = String(api.getOwnId?.() ?? '');
             console.log(`[TG→Zalo] msgStore.save for tgMsgId=${msg.message_id} msgId=${zaloMsgId} ownUid=${ownUid}`);
             msgStore.save(msg.message_id, [String(zaloMsgId)], {

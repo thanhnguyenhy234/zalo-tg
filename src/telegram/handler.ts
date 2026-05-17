@@ -1868,7 +1868,7 @@ export function setupTelegramHandler(
         const gc = groupsCache.stats();
         const sm = sentMsgStore.stats();
         const rs = reactionSummaryStore.stats();
-        const mPct = Math.round((m.cacheSize / 2000) * 100);
+        const mPct = Math.round((m.cacheSize / 10000) * 100);
         const smPct = Math.round((sm.entries / 5000) * 100);
         const ucPct = Math.round((uc.users / 5000) * 100);
         const mBar = '█'.repeat(Math.min(Math.round(mPct / 5), 20)) + '░'.repeat(Math.max(0, 20 - Math.round(mPct / 5)));
@@ -1876,7 +1876,7 @@ export function setupTelegramHandler(
           `🗄 <b>DUNG LƯỢNG CACHE</b>\n` +
           `━━━━━━━━━━━━━━━━\n` +
           `📨 <b>msgStore</b>\n` +
-          `   ${mBar} <code>${m.cacheSize}/2000</code> (${mPct}%)\n` +
+          `   ${mBar} <code>${m.cacheSize}/10000</code> (${mPct}%)\n` +
           `   Keys: <code>${m.cacheSize}</code> | Order: <code>${m.keyOrderLen}</code> | Quotes: <code>${m.quoteCount}</code>\n` +
           `📤 <b>sentMsgStore</b>\n` +
           `   <code>${sm.entries}/5000</code> (${smPct}%)\n` +

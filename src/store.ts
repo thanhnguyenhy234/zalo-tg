@@ -168,7 +168,7 @@ function buildMessageSearchSnippet(text: string): string {
   return text.length > 180 ? `${text.slice(0, 177)}…` : text;
 }
 
-const MSG_CACHE_MAX = 2000;
+const MSG_CACHE_MAX = 10000;
 
 // ── Persistence helpers for msgStore ─────────────────────────────────────────
 //

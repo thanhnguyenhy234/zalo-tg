@@ -2552,7 +2552,7 @@ sentMsgStore.save(msg.message_id, { msgIds: [zaloMsgId], zaloId, threadType });
               const sendResult = await api.sendMessage({ msg: '', attachments: [gifPath] }, zaloId, threadType);
               const zaloMsgId = extractZaloSentMsgId(sendResult);
               if (zaloMsgId !== undefined) {
-                sentMsgStore.save(msg.message_id, { msgId: zaloMsgId, zaloId, threadType });
+                sentMsgStore.save(msg.message_id, { msgIds: [zaloMsgId], zaloId, threadType });
               }
             } finally {
               sentMsgStore.unmarkSending(zaloId);

@@ -115,6 +115,54 @@ export interface ZaloQuoteData {
   threadType: 0 | 1;
 }
 
+export interface MsgSearchHit {
+  tgMsgId: number;
+  quote: ZaloQuoteData;
+  text: string;
+  snippet: string;
+}
+
+function normalizeMessageSearchValue(value: string): string {
+  return value
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/\p{Mn}/gu, '')
+    .replace(/đ/g, 'd')
+    .trim();
+}
+
+function collectSearchableStrings(value: unknown, sink: string[]): void {
+  if (value == null) return;
+  if (typeof value === 'string') {
+    const text = value.trim();
+    if (text) sink.push(text);
+    return;
+  }
+  if (typeof value === 'number' || typeof value === 'boolean') {
+    sink.push(String(value));
+    return;
+  }
+  if (Array.isArray(value)) {
+    for (const item of value) collectSearchableStrings(item, sink);
+    return;
+  }
+  if (typeof value === 'object') {
+    for (const child of Object.values(value as Record<string, unknown>)) {
+      collectSearchableStrings(child, sink);
+    }
+  }
+}
+
+function extractQuoteSearchText(content: ZaloQuoteData['content']): string {
+  const values: string[] = [];
+  collectSearchableStrings(content, values);
+  return [...new Set(values)].join(' • ');
+}
+
+function buildMessageSearchSnippet(text: string): string {
+  return text.length > 180 ? `${text.slice(0, 177)}…` : text;
+}
+
 const MSG_CACHE_MAX = 2000;
 
 // ── Persistence helpers for msgStore ─────────────────────────────────────────
@@ -310,6 +358,31 @@ export const msgStore = {
   /** Get the Zalo quote data for a given Telegram message_id (for TG→Zalo replies). */
   getQuote(tgMsgId: number): ZaloQuoteData | undefined {
     return _tgToQuote.get(tgMsgId);
+  },
+
+  /** Search recent bridged messages by textual content stored in quote payloads. */
+  searchByContent(query: string, limit = 10): MsgSearchHit[] {
+    const normalizedQuery = normalizeMessageSearchValue(query);
+    if (!normalizedQuery) return [];
+
+    const hits: MsgSearchHit[] = [];
+    for (const [tgMsgId, quote] of [..._tgToQuote.entries()].reverse()) {
+      const text = extractQuoteSearchText(quote.content);
+      if (!text) continue;
+      if (!normalizeMessageSearchValue(text).includes(normalizedQuery)) continue;
+      hits.push({ tgMsgId, quote, text, snippet: buildMessageSearchSnippet(text) });
+      if (hits.length >= limit) break;
+    }
+    return hits;
+  },
+
+  /** Count how many cached quote entries still contain searchable text. */
+  getSearchableCount(): number {
+    let count = 0;
+    for (const quote of _tgToQuote.values()) {
+      if (extractQuoteSearchText(quote.content)) count += 1;
+    }
+    return count;
   },
 
   /**
@@ -509,6 +582,14 @@ export const aliasCache = {
     return _aliasMap.get(userId);
   },
 
+  /** Preferred alias-first display name (alias if available, otherwise real name). */
+  preferredName(userId: string, realName: string): string {
+    const alias = _aliasMap.get(userId)?.trim();
+    if (alias) return alias;
+    const cleanReal = realName.trim();
+    return cleanReal || `Zalo ${userId}`;
+  },
+
   /**
    * Build display label: "Alias (Tên thật)" if alias differs from realName,
    * otherwise just realName.
@@ -571,6 +652,10 @@ export const friendsCache = {
   },
 
   get(userId: string): ZaloFriend | undefined {
+    return _friends.find(f => f.userId === userId);
+  },
+
+  getByUserId(userId: string): ZaloFriend | undefined {
     return _friends.find(f => f.userId === userId);
   },
 };

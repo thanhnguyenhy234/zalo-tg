@@ -93,7 +93,7 @@ async function populateGroupMemberCache(api: ZaloAPI, groupId: string): Promise<
 
     // memVerList entries are "uid_version" — extract all UIDs
     const allUids = (groupData.memVerList ?? [])
-      .map(s => s.split('_')[0])
+      .map((s: string) => s.split('_')[0])
       .filter(Boolean);
 
     if (allUids.length === 0) {
@@ -109,7 +109,7 @@ async function populateGroupMemberCache(api: ZaloAPI, groupId: string): Promise<
     }
 
     // --- Step 3: remaining UIDs — try PC App profile endpoint first, then fall back ---
-    const missingUids = allUids.filter(uid => !knownNames.has(uid));
+    const missingUids = allUids.filter((uid: string) => !knownNames.has(uid));
     if (missingUids.length > 0) {
       // Try PC App endpoint (profile-wpa.zaloapp.com) — separate rate-limit bucket
       const appNames = await appGetGroupMembersInfo(missingUids).catch(() => null);
@@ -258,6 +258,11 @@ async function resolveUserDisplayName(api: ZaloAPI, uid: string | undefined, fal
   // Prefer the caller-supplied fallback (e.g. senderName from message data)
   // over the raw UID — only use UID when no real name is available at all.
   return (fallback && fallback !== 'ai đó') ? fallback : (cleanUid || fallback);
+}
+
+function preferredDmTopicDisplayName(zaloId: string, realName: string): string {
+  const displayName = realName.trim() || `Zalo ${zaloId}`;
+  return aliasCache.preferredName(zaloId, displayName);
 }
 
 async function maybeRenameExistingDmTopic(

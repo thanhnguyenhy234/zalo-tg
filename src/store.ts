@@ -391,6 +391,22 @@ export const msgStore = {
   },
 
   /**
+   * Patch quote metadata from a self-echo message.
+   * This is crucial for TG→Zalo media messages: initial placeholder quote data
+   * (msgType=webchat, content='[Voice]'...) is replaced with the real Zalo
+   * payload so later replies render native quote previews in Zalo.
+   */
+  updateQuoteFromEcho(
+    tgMsgId: number,
+    patch: Partial<Pick<ZaloQuoteData, 'msgId' | 'cliMsgId' | 'msgType' | 'content' | 'ts' | 'ttl'>>,
+  ): void {
+    const quote = _tgToQuote.get(tgMsgId);
+    if (!quote) return;
+    Object.assign(quote, patch);
+    _scheduleMsgPersist();
+  },
+
+  /**
    * Update the cliMsgId on an existing quote entry.
    * Used when the Zalo echo event provides the real cliMsgId after a TG→Zalo send.
    */

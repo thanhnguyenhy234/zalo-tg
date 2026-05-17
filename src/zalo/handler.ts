@@ -579,14 +579,27 @@ export async function setupZaloHandler(api: ZaloAPI): Promise<void> {
           selfMsgIds.some(id => sentMsgStore.getByZaloMsgId(id) !== undefined)
           || sentMsgStore.isSendingTo(msg.threadId);
         if (isEcho) {
-          // The echo carries the real cliMsgId that Zalo assigned to this
-          // message. Update msgStore so that future TG→Zalo replies to this
-          // message can construct a valid quote (with a non-zero cliMsgId).
-          if (msg.data.cliMsgId) {
-            const _tgId = msgStore.getTgMsgId(msg.data.msgId);
-            if (_tgId !== undefined) {
-              msgStore.updateQuoteCliMsgId(_tgId, msg.data.cliMsgId);
-            }
+          // Hydrate quote metadata from self echo:
+          // TG→Zalo media is first stored with placeholder quote data; when echo
+          // arrives we replace it with real msgType/content so future replies in
+          // Telegram produce native quote previews in Zalo.
+          const _tgId = msgStore.getTgMsgId(msg.data.msgId)
+            ?? (msg.data.realMsgId ? msgStore.getTgMsgId(msg.data.realMsgId) : undefined)
+            ?? ((msg.data.cliMsgId && msg.data.cliMsgId !== '0')
+              ? msgStore.getTgMsgId(msg.data.cliMsgId)
+              : undefined);
+
+          if (_tgId !== undefined) {
+            const { text: _echoText, media: _echoMedia } = parseContent(msg.data.content);
+            const _echoContent = _echoText !== null ? _echoText : (_echoMedia as Record<string, unknown>);
+            msgStore.updateQuoteFromEcho(_tgId, {
+              msgId: msg.data.msgId || msg.data.realMsgId || '',
+              cliMsgId: msg.data.cliMsgId ?? '',
+              msgType: msg.data.msgType ?? ZALO_MSG_TYPES.TEXT,
+              content: _echoContent,
+              ts: msg.data.ts,
+              ttl: msg.data.ttl ?? 0,
+            });
           }
           console.log(`[Zalo→TG] Skip bot echo (${selfMsgIds.join(', ')})`);
           return;

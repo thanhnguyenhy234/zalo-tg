@@ -2340,15 +2340,6 @@ export function setupTelegramHandler(
         sentMsgStore.markSending(zaloId);
         try {
           console.log(`[TG→Zalo] Sending ${filename} → zaloId=${zaloId} type=${threadType}`);
-          // Allow ~1 MB/s minimum upload speed + 30s base; cap at 10 minutes
-          const fileSizeBytes = fileSize ?? 0;
-          const sendTimeoutMs = Math.min(Math.max(30_000, fileSizeBytes / 1024), 10 * 60_000);
-          const withTimeout = <T>(p: Promise<T>) => Promise.race([
-            p,
-            new Promise<never>((_, reject) =>
-              setTimeout(() => reject(new Error(`Send timeout (${Math.round(sendTimeoutMs / 1000)}s)`)), sendTimeoutMs),
-            ),
-          ]);
 
           // zca-js splits internally when msg is non-empty + quote is set:
           //   1) sends caption+quote as text (reply indicator in Zalo)
@@ -2367,7 +2358,7 @@ export function setupTelegramHandler(
             }];
           }
 
-          const sendResult = await withTimeout(api.sendMessage(
+          const sendResult = await api.sendMessage(
             {
               msg: effectiveCaption,
               attachments: attachmentSource,
@@ -2376,12 +2367,12 @@ export function setupTelegramHandler(
             },
             zaloId,
             threadType,
-          )).catch(async (err: unknown) => {
+          ).catch(async (err: unknown) => {
             // Code 114 with quote: quote data incompatible with this message type.
             // Retry without quote so the attachment still goes through.
             if ((err as { code?: number })?.code === 114) {
               console.warn('[TG→Zalo] code 114 on attachment+quote, retrying without quote');
-              return withTimeout(api.sendMessage(
+              return api.sendMessage(
                 {
                   msg: effectiveCaption,
                   attachments: attachmentSource,
@@ -2389,7 +2380,7 @@ export function setupTelegramHandler(
                 },
                 zaloId,
                 threadType,
-              ));
+              );
             }
             throw err;
           }) as { message?: { msgId?: number } | null; attachment?: Array<{ msgId?: number }> };

@@ -1,4 +1,4 @@
-import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'fs';
+import { readFileSync, writeFileSync, existsSync, mkdirSync, renameSync } from 'fs';
 import { gzipSync, gunzipSync } from 'zlib';
 import path from 'path';
 import { config } from './config.js';
@@ -34,7 +34,9 @@ function load(): StoreData {
 
 function persist(data: StoreData): void {
   mkdirSync(path.dirname(filePath), { recursive: true });
-  writeFileSync(filePath, JSON.stringify(data, null, 2), 'utf8');
+  const tmpPath = filePath + '.tmp';
+  writeFileSync(tmpPath, JSON.stringify(data, null, 2), 'utf8');
+  renameSync(tmpPath, filePath);
 }
 
 function zaloKey(zaloId: string, type: 0 | 1): string {
@@ -281,7 +283,9 @@ function _scheduleMsgPersist(): void {
         q,
       };
       // gzip the JSON — reduces file size ~70% with zero new deps
-      writeFileSync(_msgMapFile, gzipSync(JSON.stringify(data), { level: 9 }));
+      const _tmpMsg = _msgMapFile + '.tmp';
+      writeFileSync(_tmpMsg, gzipSync(JSON.stringify(data), { level: 9 }));
+      renameSync(_tmpMsg, _msgMapFile);
     } catch (e) {
       console.warn('[msgStore] Failed to persist msg-map:', e);
     }
@@ -505,7 +509,9 @@ function _scheduleUserCachePersist(): void {
         for (const [norm, uid] of m) obj[norm] = uid;
         disk.g[gid] = obj;
       }
-      writeFileSync(_userCacheFile, gzipSync(JSON.stringify(disk), { level: 9 }));
+      const _tmpUser = _userCacheFile + '.tmp';
+      writeFileSync(_tmpUser, gzipSync(JSON.stringify(disk), { level: 9 }));
+      renameSync(_tmpUser, _userCacheFile);
     } catch (e) {
       console.warn('[userCache] Failed to persist:', e);
     }

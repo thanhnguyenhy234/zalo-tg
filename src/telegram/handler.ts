@@ -12,6 +12,7 @@ import { config } from '../config.js';
 import { unreadState } from '../unread-state.js';
 import { downloadToTemp, cleanTemp, convertToM4a, extractVideoThumbnail, convertWebmToGif, convertTgsToGif } from '../utils/media.js';
 import { triggerQRLogin } from '../zalo/client.js';
+import { appGetReceivedFriendRequests, appGetSentFriendRequests } from '../zalo/appApi.js';
 import { escapeHtml } from '../utils/format.js';
 
 // Bridge start time (module load = process start)
@@ -1251,6 +1252,101 @@ export function setupTelegramHandler(
   });
 
   // ── /friendrequests ────────────────────────────────────────────────────────
+  async function getFriendRequestsMessage(page: number) {
+    if (!currentApi) throw new Error('Zalo chưa kết nối');
+
+    let [sentReqs, recvRecommends, groupInvites] = await Promise.all([
+      appGetSentFriendRequests(500),
+      appGetReceivedFriendRequests(500),
+      currentApi.getGroupInviteBoxList({ invPerPage: 100 }) as Promise<any>,
+    ]);
+
+    if (!sentReqs || Object.keys(sentReqs).length === 0) {
+      sentReqs = (await currentApi.getSentFriendRequest()) as any;
+    }
+    if (!recvRecommends || recvRecommends.length === 0) {
+      const webRec = await currentApi.getFriendRecommendations() as any;
+      recvRecommends = webRec?.recommItems || [];
+    }
+
+    const receivedReqs = (recvRecommends ?? [])
+      .filter((item: any) => item.dataInfo?.recommType === 2 || item.recommType === 2)
+      .map((item: any) => item.dataInfo || item);
+    const sentList = Object.values(sentReqs ?? {});
+    const invites = groupInvites?.invitations ?? [];
+
+    const allItems: Array<{ type: 'recv' | 'sent' | 'group', data: any }> = [
+      ...receivedReqs.map((d: any) => ({ type: 'recv' as const, data: d })),
+      ...sentList.map((d: any) => ({ type: 'sent' as const, data: d })),
+      ...invites.map((d: any) => ({ type: 'group' as const, data: d })),
+    ];
+
+    if (allItems.length === 0) {
+      return { text: '✅ Không có lời mời nào đang chờ.', reply_markup: undefined };
+    }
+
+    const PAGE_SIZE = 10;
+    const totalPages = Math.ceil(allItems.length / PAGE_SIZE);
+    const safePage = Math.max(0, Math.min(page, totalPages - 1));
+    const pagedItems = allItems.slice(safePage * PAGE_SIZE, (safePage + 1) * PAGE_SIZE);
+
+    const parts: string[] = [`📋 <b>Danh sách lời mời (Trang ${safePage + 1}/${totalPages})</b>
+`];
+    const inlineKeyboards: any[] = [];
+
+    const pagedRecv = pagedItems.filter(i => i.type === 'recv');
+    if (pagedRecv.length > 0) {
+      parts.push(`📥 <b>Nhận được:</b>`);
+      for (const { data: u } of pagedRecv) {
+        const name = escapeHtml(u.displayName || u.zaloName || u.userId);
+        const msg  = u.recommInfo?.message ? ` — "${escapeHtml(u.recommInfo.message)}"` : '';
+        parts.push(`• ${name}${msg}`);
+        inlineKeyboards.push([{ text: `✅ Chấp nhận ${u.displayName || u.zaloName}`, callback_data: `afr:${u.userId}` }]);
+      }
+    }
+
+    const pagedSent = pagedItems.filter(i => i.type === 'sent');
+    if (pagedSent.length > 0) {
+      parts.push(`
+📤 <b>Đã gửi:</b>`);
+      for (const { data: u } of pagedSent) {
+        const name = escapeHtml(u.displayName || u.zaloName || u.userId || 'không rõ');
+        const msg  = u.fReqInfo?.message ? ` — "${escapeHtml(u.fReqInfo.message)}"` : '';
+        parts.push(`• ${name}${msg}`);
+        inlineKeyboards.push([{ text: `❌ Thu hồi lời mời ${name}`, callback_data: `ufr:${u.userId}` }]);
+      }
+    }
+
+    const pagedGroup = pagedItems.filter(i => i.type === 'group');
+    if (pagedGroup.length > 0) {
+      parts.push(`
+📬 <b>Nhóm:</b>`);
+      for (const { data: inv } of pagedGroup) {
+        const g = inv.groupInfo;
+        const exp = new Date(Number(inv.expiredTs) * 1000).toLocaleDateString('vi-VN');
+        parts.push(`• 👥 <b>${escapeHtml(g.name)}</b> (${g.totalMember} TV)
+  Mời bởi: ${escapeHtml(inv.inviterInfo.dName)} · HH: ${exp}`);
+        inlineKeyboards.push([{ text: `✅ Tham gia ${g.name}`, callback_data: `jgi:${g.groupId}` }]);
+      }
+    }
+
+    const navButtons: Array<{ text: string; callback_data: string }> = [];
+    if (safePage > 0) {
+      navButtons.push({ text: '⬅️ Trang trước', callback_data: `frq_pg:${safePage - 1}` });
+    }
+    if (safePage < totalPages - 1) {
+      navButtons.push({ text: 'Trang sau ➡️', callback_data: `frq_pg:${safePage + 1}` });
+    }
+    if (navButtons.length > 0) {
+      inlineKeyboards.push(navButtons);
+    }
+
+    return {
+      text: parts.join('\n'),
+      reply_markup: inlineKeyboards.length > 0 ? { inline_keyboard: inlineKeyboards } : undefined,
+    };
+  }
+
   tgBot.command('friendrequests', async (ctx) => {
     if (ctx.chat.id !== config.telegram.groupId) return;
     const threadId = 'message_thread_id' in ctx.message
@@ -1264,91 +1360,12 @@ export function setupTelegramHandler(
     }
 
     try {
-      const [sentReqs, recvRecommends, groupInvites] = await Promise.all([
-        currentApi.getSentFriendRequest() as Promise<Record<string, {
-          zaloName: string; displayName: string; fReqInfo: { message: string; time: number };
-        }>>,
-        currentApi.getFriendRecommendations() as Promise<{
-          recommItems?: Array<{
-            recommItemType: number;
-            dataInfo: {
-              userId: string;
-              zaloName: string;
-              displayName: string;
-              recommType: number;  // 2 = ReceivedFriendRequest
-              recommInfo?: { message?: string | null };
-            };
-          }>;
-        }>,
-        currentApi.getGroupInviteBoxList({ invPerPage: 20 }) as Promise<{
-          invitations: Array<{
-            groupInfo: { groupId: string; name: string; totalMember: number };
-            inviterInfo: { dName: string };
-            expiredTs: string;
-          }>;
-          total: number;
-        }>,
-      ]);
-
-      const parts: string[] = [];
-      const inlineKeyboards: Array<[{ text: string; callback_data: string }]> = [];
-
-      // Lời mời kết bạn nhận được (recommType === 2)
-      const receivedReqs = (recvRecommends?.recommItems ?? [])
-        .filter(item => item.dataInfo?.recommType === 2)
-        .map(item => item.dataInfo);
-      if (receivedReqs.length > 0) {
-        parts.push(`📥 <b>Lời mời kết bạn nhận được (${receivedReqs.length})</b>`);
-        for (const u of receivedReqs.slice(0, 20)) {
-          const name = escapeHtml(u.displayName || u.zaloName || u.userId);
-          const msg  = u.recommInfo?.message ? ` — "${escapeHtml(u.recommInfo.message)}"` : '';
-          parts.push(`• ${name}${msg}`);
-          inlineKeyboards.push([{
-            text: `✅ Chấp nhận ${u.displayName || u.zaloName}`,
-            callback_data: `afr:${u.userId}`,
-          }]);
-        }
-        if (receivedReqs.length > 20) parts.push(`  <i>... và ${receivedReqs.length - 20} người khác</i>`);
-      }
-
-      // Lời mời kết bạn đã gửi
-      const sentList = Object.values(sentReqs ?? {});
-      if (sentList.length > 0) {
-        parts.push(`\n📤 <b>Lời mời kết bạn đã gửi (${sentList.length})</b>`);
-        for (const u of sentList.slice(0, 10)) {
-          const name = escapeHtml(u.displayName || u.zaloName);
-          const msg  = u.fReqInfo?.message ? ` — "${escapeHtml(u.fReqInfo.message)}"` : '';
-          parts.push(`• ${name}${msg}`);
-        }
-        if (sentList.length > 10) parts.push(`  <i>... và ${sentList.length - 10} người khác</i>`);
-      }
-
-      // Lời mời tham gia nhóm
-      const invites = groupInvites?.invitations ?? [];
-      if (invites.length > 0) {
-        parts.push(`\n📬 <b>Lời mời tham gia nhóm (${invites.length})</b>`);
-        for (const inv of invites.slice(0, 10)) {
-          const g   = inv.groupInfo;
-          const exp = new Date(Number(inv.expiredTs) * 1000).toLocaleDateString('vi-VN');
-          parts.push(`• 👥 <b>${escapeHtml(g.name)}</b> (${g.totalMember} TV)\n  Mời bởi: ${escapeHtml(inv.inviterInfo.dName)} · HH: ${exp}`);
-          inlineKeyboards.push([{
-            text: `✅ Tham gia ${g.name}`,
-            callback_data: `jgi:${g.groupId}`,
-          }]);
-        }
-      }
-
-      if (parts.length === 0) parts.push('✅ Không có lời mời nào đang chờ.');
-
-      await ctx.telegram.sendMessage(
-        config.telegram.groupId,
-        parts.join('\n'),
-        {
-          ...replyOpts,
-          parse_mode: 'HTML',
-          ...(inlineKeyboards.length > 0 ? { reply_markup: { inline_keyboard: inlineKeyboards } } : {}),
-        },
-      );
+      const { text, reply_markup } = await getFriendRequestsMessage(0);
+      await ctx.telegram.sendMessage(config.telegram.groupId, text, {
+        ...replyOpts,
+        parse_mode: 'HTML',
+        ...(reply_markup ? { reply_markup } : {}),
+      });
     } catch (err) {
       console.error('[/friendrequests]', err);
       await ctx.telegram.sendMessage(config.telegram.groupId, '❌ Lỗi lấy danh sách lời mời.', replyOpts);
@@ -1697,6 +1714,23 @@ export function setupTelegramHandler(
       return;
     }
 
+    // ── frq_pg: friend requests pagination ────────────────────────────────────
+    if (data?.startsWith('frq_pg:')) {
+      const page = Number(data.slice(7));
+      try {
+        const { text, reply_markup } = await getFriendRequestsMessage(page);
+        await ctx.editMessageText(text, {
+          parse_mode: 'HTML',
+          reply_markup,
+        });
+        await ctx.answerCbQuery();
+      } catch (err) {
+        console.error('[cb/frq_pg]', err);
+        await ctx.answerCbQuery('❌ Lỗi tải trang');
+      }
+      return;
+    }
+
     // ── afr: accept friend request ────────────────────────────────────────────
     if (data?.startsWith('afr:')) {
       const userId = data.slice(4);
@@ -1708,6 +1742,20 @@ export function setupTelegramHandler(
       } catch (err) {
         console.error('[cb/afr]', err);
         await ctx.answerCbQuery('❌ Không thể chấp nhận lời mời');
+      }
+      return;
+    }
+
+    // ── ufr: undo friend request ──────────────────────────────────────────────
+    if (data?.startsWith('ufr:')) {
+      const userId = data.slice(4);
+      if (!currentApi) { await ctx.answerCbQuery('❌ Zalo chưa kết nối'); return; }
+      try {
+        await currentApi.undoFriendRequest(userId);
+        await ctx.answerCbQuery('✅ Đã thu hồi lời mời kết bạn!');
+      } catch (err) {
+        console.error('[cb/ufr]', err);
+        await ctx.answerCbQuery('❌ Không thể thu hồi lời mời');
       }
       return;
     }

@@ -14,6 +14,17 @@ const SCRIPTS_DIR = path.resolve(
 
 const TMP_DIR = path.join(os.tmpdir(), 'zalo-tg');
 
+/** Keep readable Unicode filenames, but remove path/control chars unsafe on disk. */
+function sanitizeFileName(fileName: string, fallback = `download_${Date.now()}`): string {
+  const cleaned = fileName
+    .normalize('NFC')
+    .replace(/[\/:*?"<>|\u0000-\u001F]/g, '_')
+    .replace(/^\.+$/, '_')
+    .trim()
+    .slice(0, 180);
+  return cleaned || fallback;
+}
+
 /** Download a remote URL to a temp file. Returns the local file path.
  *  When using a local Telegram Bot API server (--local flag), getFileLink()
  *  returns a file:// URL pointing to the server's working directory.
@@ -25,9 +36,7 @@ export async function downloadToTemp(url: string, fileName?: string, retries = 3
   // Local Bot API server returns file:// paths — copy directly, no HTTP needed
   if (url.startsWith('file:')) {
     const srcPath = fileURLToPath(url);
-    const baseName = (fileName ?? path.basename(srcPath))
-      .replace(/[^a-zA-Z0-9._-]/g, '_')
-      .slice(0, 128);
+    const baseName = sanitizeFileName(fileName ?? path.basename(srcPath));
     const destPath = path.join(TMP_DIR, `${Date.now()}_${Math.random().toString(36).slice(2, 7)}_${baseName}`);
     copyFileSync(srcPath, destPath);
     // Delete the original from local server's data dir — it's been delivered, no longer needed
@@ -38,9 +47,7 @@ export async function downloadToTemp(url: string, fileName?: string, retries = 3
   // Sanitize filename and add a unique prefix so concurrent downloads
   // with the same logical name (e.g. multiple 'photo.jpg' in a media group)
   // do not overwrite each other.
-  const baseName = (fileName ?? `download_${Date.now()}`)
-    .replace(/[^a-zA-Z0-9._-]/g, '_')
-    .slice(0, 128);
+  const baseName = sanitizeFileName(fileName ?? `download_${Date.now()}`);
 
   let lastErr: unknown;
   for (let attempt = 0; attempt < retries; attempt++) {

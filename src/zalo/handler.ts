@@ -57,6 +57,40 @@ function parseBankCardHtml(html: string): BankCardInfo | null {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
+const POPULATE_GROUP_MEMBER_CACHE_RETRYABLE_CODES = new Set([-69, 221]);
+const POPULATE_GROUP_MEMBER_CACHE_STARTUP_DELAY_MS = 2_000;
+const POPULATE_GROUP_MEMBER_CACHE_BATCH_DELAY_MS = 750;
+
+function sleep(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function getZaloErrorCode(err: unknown): number | undefined {
+  const code = (err as { code?: unknown })?.code;
+  return typeof code === 'number' ? code : undefined;
+}
+
+function isPopulateGroupMemberRetryable(err: unknown): boolean {
+  const code = getZaloErrorCode(err);
+  return code !== undefined && POPULATE_GROUP_MEMBER_CACHE_RETRYABLE_CODES.has(code);
+}
+
+async function retryPopulateGroupMemberCall<T>(label: string, fn: () => Promise<T>, attempts = 4): Promise<T> {
+  for (let attempt = 0; attempt < attempts; attempt++) {
+    try {
+      return await fn();
+    } catch (err) {
+      if (!isPopulateGroupMemberRetryable(err) || attempt === attempts - 1) throw err;
+      const code = getZaloErrorCode(err);
+      const waitMs = POPULATE_GROUP_MEMBER_CACHE_STARTUP_DELAY_MS * (attempt + 1);
+      console.warn(`[Zalo] ${label} rate-limited for retry (code ${code}), wait ${waitMs} ms`);
+      await sleep(waitMs);
+    }
+  }
+
+  throw new Error(`[Zalo] ${label} retry loop exhausted unexpectedly`);
+}
+
 /**
  * Fetch group member list and populate `userCache` so mention resolution works
  * immediately even before any group message is received.
@@ -68,7 +102,7 @@ async function populateGroupMemberCache(api: ZaloAPI, groupId: string): Promise<
 
     if (!groupData) {
       // Fallback: zca-js web API (rate-limited)
-      const info = await api.getGroupInfo(groupId) as {
+      const info = await retryPopulateGroupMemberCall(`getGroupInfo(${groupId})`, async () => api.getGroupInfo(groupId)) as {
         gridInfoMap?: Record<string, {
           memVerList?: string[];
           currentMems?: Array<{ id: string; dName?: string; zaloName?: string }>;
@@ -123,13 +157,26 @@ async function populateGroupMemberCache(api: ZaloAPI, groupId: string): Promise<
 
       // Final fallback: zca-js getUserInfo (web API)
       if (stillMissing.length > 0) {
-        const BATCH = 50;
+        const BATCH = 25;
         for (let i = 0; i < stillMissing.length; i += BATCH) {
           const batch = stillMissing.slice(i, i + BATCH);
-          const resp = await api.getUserInfo(batch) as {
+          let resp: {
             changed_profiles?: Record<string, { displayName?: string; zaloName?: string }>;
             unchanged_profiles?: Record<string, unknown>;
           };
+
+          try {
+            resp = await retryPopulateGroupMemberCall(`getUserInfo(${groupId})`, async () => api.getUserInfo(batch)) as typeof resp;
+          } catch (err) {
+            if (isPopulateGroupMemberRetryable(err)) {
+              console.warn(
+                `[Zalo] getUserInfo(${groupId}) stayed rate-limited; keep partial cache ${saved}/${allUids.length} for now`,
+              );
+              break;
+            }
+            throw err;
+          }
+
           const profiles = resp?.changed_profiles ?? {};
           const unchanged = resp?.unchanged_profiles ?? {};
           for (const uid of batch) {
@@ -139,6 +186,7 @@ async function populateGroupMemberCache(api: ZaloAPI, groupId: string): Promise<
             const name = p?.displayName?.trim() || p?.zaloName?.trim();
             if (uid && name) { userCache.saveForGroup(uid, name, groupId); saved++; }
           }
+          if (i + BATCH < stillMissing.length) await sleep(POPULATE_GROUP_MEMBER_CACHE_BATCH_DELAY_MS);
         }
       }
     }
@@ -146,6 +194,13 @@ async function populateGroupMemberCache(api: ZaloAPI, groupId: string): Promise<
     console.log(`[Zalo] Cached ${saved}/${allUids.length} members for group ${groupId}` +
       (missingUids.length ? ` (currentMems: ${knownNames.size}, extra fetch: ${missingUids.length})` : ' (all from currentMems)'));
   } catch (err) {
+    if (isPopulateGroupMemberRetryable(err)) {
+      console.warn(
+        `[Zalo] populateGroupMemberCache skipped for ${groupId} after repeated rate limits (code ${getZaloErrorCode(err)}); ` +
+        'will keep existing partial cache and rely on live sender data',
+      );
+      return;
+    }
     console.warn(`[Zalo] populateGroupMemberCache failed for ${groupId}:`, err);
   }
 }
@@ -442,6 +497,19 @@ function buildScoreText(header: string, options: Pick<PollOptions, 'content' | '
 
 /** Track which groups already had their member cache populated this session. */
 const _memberCacheLoaded = new Set<string>();
+const _memberCacheLoading = new Set<string>();
+
+async function warmGroupMemberCache(api: ZaloAPI, groupId: string): Promise<void> {
+  if (_memberCacheLoaded.has(groupId) || _memberCacheLoading.has(groupId)) return;
+
+  _memberCacheLoading.add(groupId);
+  try {
+    await populateGroupMemberCache(api, groupId);
+  } finally {
+    _memberCacheLoading.delete(groupId);
+    _memberCacheLoaded.add(groupId);
+  }
+}
 
 /**
  * In-flight dedup set — holds msgIds that are currently being processed.
@@ -452,17 +520,16 @@ const _inFlightMsgIds = new Set<string>();
 
 export async function setupZaloHandler(api: ZaloAPI): Promise<void> {
   // Pre-populate userCache for all existing group topics on startup.
-  // Stagger calls by 2 s each to avoid triggering the rate limiter (code 221).
+  // Stagger calls to avoid hitting startup rate limits while still warming in background.
   const startupGroups = store.all().filter(e => e.type === 1 /* Group */);
-  for (const entry of startupGroups) {
-    _memberCacheLoaded.add(entry.zaloId);
-  }
   void (async () => {
     for (let i = 0; i < startupGroups.length; i++) {
-      if (i > 0) await new Promise(r => setTimeout(r, 0));
-      void populateGroupMemberCache(api, startupGroups[i].zaloId);
+      if (i > 0) await sleep(POPULATE_GROUP_MEMBER_CACHE_STARTUP_DELAY_MS);
+      await warmGroupMemberCache(api, startupGroups[i].zaloId);
     }
-  })();
+  })().catch(err => {
+    console.warn('[Zalo] startup member-cache warmup aborted:', err);
+  });
 
   // Load address-book names BEFORE attaching listeners so that the first
   // message event already has names available for topic naming.
@@ -555,9 +622,8 @@ export async function setupZaloHandler(api: ZaloAPI): Promise<void> {
       }
 
       // Pre-populate member cache the first time we see a new group
-      if (type === 1 && !_memberCacheLoaded.has(zaloId)) {
-        _memberCacheLoaded.add(zaloId);
-        void populateGroupMemberCache(api, zaloId);
+      if (type === 1 && !_memberCacheLoaded.has(zaloId) && !_memberCacheLoading.has(zaloId)) {
+        void warmGroupMemberCache(api, zaloId);
       }
 
       // Parse content early so we can start media download in parallel with topic resolution

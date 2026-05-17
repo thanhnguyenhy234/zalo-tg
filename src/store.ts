@@ -1022,7 +1022,7 @@ export const zaloAlbumStore = {
   },
 };
 
-// ── Poll store (Zalo ↔ TG native poll) ───────────────────────────────────────
+// ── Poll store (Zalo ↔ TG native poll, persisted to disk) ─────────────────────
 
 export interface PollEntry {
   pollId:           number;
@@ -1038,15 +1038,55 @@ export interface PollEntry {
   }[];
 }
 
+const _pollFile = path.resolve(config.dataDir, 'polls.json.gz');
+
+function _loadPolls(): void {
+  if (!existsSync(_pollFile)) return;
+  try {
+    const buf = readFileSync(_pollFile);
+    const raw = JSON.parse(gunzipSync(buf).toString('utf8')) as { entries: PollEntry[] };
+    for (const entry of raw.entries ?? []) {
+      _pollByZaloId.set(entry.pollId, entry);
+      _pollByTgId.set(entry.tgPollMsgId, entry);
+      _pollByUUID.set(entry.tgPollUUID, entry);
+    }
+    console.log(`[pollStore] Loaded ${raw.entries.length} polls from disk`);
+  } catch (e) {
+    console.warn('[pollStore] Failed to load polls:', e);
+  }
+}
+
+let _pollPersistTimer: ReturnType<typeof setTimeout> | null = null;
+function _schedulePollPersist(): void {
+  if (_pollPersistTimer) return;
+  _pollPersistTimer = setTimeout(() => {
+    _pollPersistTimer = null;
+    try {
+      mkdirSync(path.dirname(_pollFile), { recursive: true });
+      const entries: PollEntry[] = [];
+      for (const e of _pollByZaloId.values()) entries.push(e);
+      const tmp = _pollFile + '.tmp';
+      writeFileSync(tmp, gzipSync(JSON.stringify({ entries }), { level: 9 }));
+      renameSync(tmp, _pollFile);
+    } catch (e) {
+      console.warn('[pollStore] Failed to persist:', e);
+    }
+  }, 1500);
+}
+
 const _pollByZaloId = new Map<number, PollEntry>();       // pollId → entry
 const _pollByTgId   = new Map<number, PollEntry>();       // tgPollMsgId → entry
 const _pollByUUID   = new Map<string, PollEntry>();       // tgPollUUID → entry
+
+// Load persisted polls on startup
+_loadPolls();
 
 export const pollStore = {
   save(entry: PollEntry): void {
     _pollByZaloId.set(entry.pollId, entry);
     _pollByTgId.set(entry.tgPollMsgId, entry);
     _pollByUUID.set(entry.tgPollUUID, entry);
+    _schedulePollPersist();
   },
 
   getByPollId(pollId: number): PollEntry | undefined {
@@ -1064,6 +1104,9 @@ export const pollStore = {
   /** Update tgScoreMsgId after editing */
   updateScoreMsg(pollId: number, newMsgId: number): void {
     const e = _pollByZaloId.get(pollId);
-    if (e) e.tgScoreMsgId = newMsgId;
+    if (e) {
+      e.tgScoreMsgId = newMsgId;
+      _schedulePollPersist();
+    }
   },
 };

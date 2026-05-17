@@ -1553,6 +1553,7 @@ export function setupTelegramHandler(
       `⏱ Uptime: <code>${uptimeStr}</code>\n` +
       `📌 Topics: <b>${all.length}</b> (${groupCount} nhóm, ${dmCount} DM)` +
       localApiSection,
+      { parse_mode: 'HTML' },
     );
   });
 

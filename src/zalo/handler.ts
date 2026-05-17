@@ -598,11 +598,10 @@ export async function setupZaloHandler(api: ZaloAPI): Promise<void> {
         displayName = info.name || senderName;
         groupAvatarUrl = info.avt;
       } else {
-        // For DMs, zaloId is the peer's UID — keep the topic alias-first but use the
-        // resolved contact-book name for message captions and bridge cache.
+        // For DMs, zaloId is the peer's UID — keep the topic alias-first while leaving
+        // bridgeSenderName as the actual sender label resolved above (or "Bạn" for self).
         const realName = await resolveUserDisplayName(api, zaloId);
         displayName = preferredDmTopicDisplayName(zaloId, realName);
-        bridgeSenderName = realName;
       }
 
       // Keep userCache up-to-date so TG→Zalo mention resolution works.
@@ -774,8 +773,7 @@ export async function setupZaloHandler(api: ZaloAPI): Promise<void> {
         const albumKey = `${zaloId}:${senderUid}`;
 
         // If childnumber > 0 OR there's already a buffer for this key → album mode
-        const hasBuffer = (typeof zaloAlbumStore as unknown as { _has?: (k: string) => boolean })._has?.(albumKey);
-        void hasBuffer; // unused, we detect via the add callback
+        // Reuse or create the album buffer via the add callback below.
 
         zaloAlbumStore.add(
           albumKey,

@@ -900,7 +900,6 @@ ${escapeHtml(photoCaption)}`
                   : groupCaption(buf.senderName);
                 // Telegram limits media groups to 10 items — split into batches
                 const BATCH = 10;
-                let firstSaved = false;
                 for (let i = 0; i < localPaths.length; i += BATCH) {
                   const batch = localPaths.slice(i, i + BATCH);
                   // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -914,11 +913,10 @@ ${escapeHtml(photoCaption)}`
                     mediaItems,
                     { message_thread_id: buf.topicId } as Parameters<typeof tg.sendMediaGroup>[2],
                   );
-                  // Save mapping for the very first photo (for reply chain)
-                  if (!firstSaved && sentMsgs.length > 0) {
-                    firstSaved = true;
-                    // Use buf.zaloQuote (correct cliMsgId + parsed media object)
-                    msgStore.save(sentMsgs[0]!.message_id, buf.zaloMsgIds, buf.zaloQuote!);
+                  // Save mapping for every photo so replying to ANY album photo
+                  // produces a valid Zalo quote
+                  for (const sentMsg of sentMsgs) {
+                    msgStore.save(sentMsg.message_id, buf.zaloMsgIds, buf.zaloQuote!);
                   }
                 }
               } finally {

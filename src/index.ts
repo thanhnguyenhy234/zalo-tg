@@ -134,6 +134,8 @@ async function main(): Promise<void> {
     console.log(`\n[Boot] Received ${signal}, shutting down...`);
     try { const api = await getZaloApi(); api.listener.stop(); } catch { /* ignore */ }
     await tgBot.stop(signal);
+    // Wait for debounced persistence (msgStore 1000ms, userCache 2000ms) to flush
+    await new Promise(r => setTimeout(r, 2500));
     process.exit(0);
   };
 

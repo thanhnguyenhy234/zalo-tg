@@ -1,4 +1,4 @@
-import { ThreadType, type AttachmentSource } from 'zca-js';
+import { Reactions, ThreadType, type AttachmentSource } from 'zca-js';
 import path from 'path';
 import { createReadStream } from 'fs';
 import { readFile, stat, open } from 'fs/promises';
@@ -2086,8 +2086,8 @@ export function setupTelegramHandler(
         '😘':  ':-*',
         '🥰':  ';xx',
         '😍':  ';xx',
-        '🤣':  ":'>",
-        '😂':  ":'>",
+        '🤣':  Reactions.TEARS_OF_JOY,
+        '😂':  Reactions.TEARS_OF_JOY,
         '💩':  '/-shit',
         '🌹':  '/-rose',
         '💔':  '/-break',
@@ -2128,7 +2128,7 @@ export function setupTelegramHandler(
       reactionEchoStore.mark(quote.zaloId, quote.msgId, zaloIcon);
       try {
         await currentApi.addReaction(
-          { rType: 0, source: 0, icon: zaloIcon },
+          zaloIcon as Reactions,
           {
             data: { msgId: quote.msgId, cliMsgId: quote.cliMsgId },
             threadId: quote.zaloId,

@@ -41,7 +41,7 @@ import { config } from '../config.js';
 import { unreadState } from '../unread-state.js';
 import { downloadToTemp, cleanTemp, convertToM4a, extractVideoThumbnail, convertWebmToGif, convertTgsToGif } from '../utils/media.js';
 import { triggerQRLogin } from '../zalo/client.js';
-import { appGetReceivedFriendRequests, appGetSentFriendRequests } from '../zalo/appApi.js';
+import { appGetReceivedFriendRequests, appGetSentFriendRequests, appGetGroupInfo, appGetGroupMembersInfo } from '../zalo/appApi.js';
 import { escapeHtml } from '../utils/format.js';
 
 // Bridge start time (module load = process start)
@@ -1121,6 +1121,152 @@ Toàn bộ icon hỗ trợ (${stickers.length}):
       );
     }
   });
+
+  // /group_info - show Zalo group metadata and member names for the current topic.
+  // Usage inside a Zalo group topic: /group_info [all] or /group_infoall
+  const handleGroupInfoCommand = async (ctx: { chat?: { id: number }; message: { text?: string; message_thread_id?: number }; telegram: typeof tgBot.telegram }, forceAll = false) => {
+    if (!ctx.chat || ctx.chat.id !== config.telegram.groupId) return;
+    const topicId = ctx.message.message_thread_id;
+    const replyOpts = topicId ? { message_thread_id: topicId } : {};
+
+    if (!topicId) {
+      await ctx.telegram.sendMessage(
+        config.telegram.groupId,
+        '⚠️ Hãy gửi <code>/group_info</code> trong topic của nhóm Zalo cần xem.',
+        { ...replyOpts, parse_mode: 'HTML' },
+      );
+      return;
+    }
+
+    const entry = store.getEntryByTopic(topicId);
+    if (!entry || entry.type !== 1) {
+      await ctx.telegram.sendMessage(config.telegram.groupId, '❌ Topic này không phải nhóm Zalo.', replyOpts);
+      return;
+    }
+
+    if (!currentApi) {
+      await ctx.telegram.sendMessage(config.telegram.groupId, '❌ Zalo chưa kết nối', replyOpts);
+      return;
+    }
+
+    const showAll = forceAll || /\ball\b/i.test(ctx.message.text ?? '');
+    const groupId = entry.zaloId;
+
+    try {
+      let groupData = await appGetGroupInfo(groupId);
+      if (!groupData) {
+        const info = await currentApi.getGroupInfo(groupId) as {
+          gridInfoMap?: Record<string, {
+            name?: string;
+            avt?: string;
+            memVerList?: string[];
+            currentMems?: Array<{ id: string; dName?: string; zaloName?: string }>;
+            totalMember?: number;
+            hasMoreMember?: number;
+          }>;
+        } | undefined;
+        groupData = info?.gridInfoMap?.[groupId] ?? null;
+      }
+
+      if (!groupData) {
+        await ctx.telegram.sendMessage(
+          config.telegram.groupId,
+          '❌ Không lấy được thông tin nhóm từ Zalo API. Có thể session hết hạn hoặc Zalo đang giới hạn request.',
+          replyOpts,
+        );
+        return;
+      }
+
+      const knownNames = new Map<string, string>();
+      for (const member of groupData.currentMems ?? []) {
+        const name = member.dName?.trim() || member.zaloName?.trim();
+        if (member.id && name) knownNames.set(member.id, name);
+      }
+
+      const memberUids = Array.from(new Set(
+        (groupData.memVerList ?? [])
+          .map((value) => String(value).split('_')[0])
+          .filter(Boolean),
+      ));
+
+      const missingUids = memberUids.filter((uid) => !knownNames.has(uid));
+      if (missingUids.length > 0) {
+        const appNames = await appGetGroupMembersInfo(missingUids).catch(() => null);
+        for (const uid of missingUids) {
+          const name = appNames?.get(uid);
+          if (name) knownNames.set(uid, name);
+        }
+      }
+
+      const members = memberUids
+        .map((uid) => {
+          const aliasName = aliasCache.get(uid)?.trim();
+          const profileName = knownNames.get(uid);
+          return {
+            uid,
+            name: aliasName || profileName || uid,
+            profileName,
+            isAlias: Boolean(aliasName),
+          };
+        })
+        .sort((a, b) => a.name.localeCompare(b.name, 'vi'));
+
+      const groupName = groupData.name?.trim() || entry.name;
+      const totalMember = groupData.totalMember ?? memberUids.length;
+      const resolvedCount = members.filter((member) => member.name !== member.uid).length;
+      const displayLimit = showAll ? members.length : 120;
+      const visibleMembers = members.slice(0, displayLimit);
+
+      const headerLines = [
+        `👥 <b>${escapeHtml(groupName)}</b>`,
+        `Zalo ID: <code>${escapeHtml(groupId)}</code>`,
+        `Thành viên: <b>${totalMember}</b>`,
+        `Đọc được tên: <b>${resolvedCount}/${memberUids.length}</b>`,
+      ];
+      if (!showAll && members.length > displayLimit) {
+        headerLines.push('', `ℹ️ Đang hiện ${displayLimit}/${members.length} người. Gõ <code>/group_info all</code> để xem hết.`);
+      }
+
+      const lines = visibleMembers.map((member, index) => {
+        const suffix = member.name === member.uid
+          ? ` <code>${escapeHtml(member.uid)}</code>`
+          : (member.isAlias && member.profileName && member.profileName !== member.name
+              ? ` <i>(${escapeHtml(member.profileName)})</i>`
+              : '');
+        return `${index + 1}. ${escapeHtml(member.name)}${suffix}`;
+      });
+
+      const chunks: string[] = [];
+      let current = headerLines.join('\n') + '\n\n';
+      for (const line of lines) {
+        const candidate = current + line + '\n';
+        if (candidate.length > 3500 && current.trim()) {
+          chunks.push(current.trimEnd());
+          current = line + '\n';
+        } else {
+          current = candidate;
+        }
+      }
+      if (current.trim()) chunks.push(current.trimEnd());
+
+      for (const chunk of chunks) {
+        await ctx.telegram.sendMessage(
+          config.telegram.groupId,
+          chunk,
+          { ...replyOpts, parse_mode: 'HTML' },
+        );
+      }
+    } catch (err) {
+      await ctx.telegram.sendMessage(
+        config.telegram.groupId,
+        `❌ Lỗi lấy thông tin nhóm: <code>${escapeHtml(err instanceof Error ? err.message : String(err))}</code>`,
+        { ...replyOpts, parse_mode: 'HTML' },
+      );
+    }
+  };
+
+  tgBot.command('group_info', async (ctx) => handleGroupInfoCommand(ctx));
+  tgBot.command('group_infoall', async (ctx) => handleGroupInfoCommand(ctx, true));
 
   tgBot.command('recall', async (ctx) => {
     if (ctx.chat.id !== config.telegram.groupId) return;

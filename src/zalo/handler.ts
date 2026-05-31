@@ -12,17 +12,54 @@ import { config } from '../config.js';
 import { downloadToTemp, cleanTemp } from '../utils/media.js';
 import { applyZaloMarkupHtml, formatGroupMsgHtml, formatGroupMsg, groupCaption, topicName, truncate, escapeHtml } from '../utils/format.js';
 import type { ZaloStyle } from '../utils/format.js';
-import { msgStore, userCache, pollStore, sentMsgStore, zaloAlbumStore, reactionEchoStore, reactionSummaryStore, aliasCache, friendsCache, type ZaloQuoteData } from '../store.js';
+import { msgStore, userCache, pollStore, sentMsgStore, zaloAlbumStore, reactionEchoStore, reactionSummaryStore, aliasCache, friendsCache, pendingNamePromptStore, type ZaloQuoteData } from '../store.js';
 import { tgQueue } from '../utils/tgQueue.js';
+
+function normalizeTelegramArg(value: unknown): unknown {
+  if (value == null || Buffer.isBuffer(value)) return value;
+
+  if (Array.isArray(value)) {
+    let changed = false;
+    const next = value.map((item) => {
+      const normalized = normalizeTelegramArg(item);
+      if (normalized !== item) changed = true;
+      return normalized;
+    });
+    return changed ? next : value;
+  }
+
+  if (typeof value === 'object') {
+    const maybeStream = value as { path?: unknown; pipe?: unknown };
+    if (typeof maybeStream.path === 'string' && typeof maybeStream.pipe === 'function') {
+      return maybeStream.path;
+    }
+
+    let changed = false;
+    const next: Record<string, unknown> = {};
+    for (const [key, child] of Object.entries(value as Record<string, unknown>)) {
+      const normalized = normalizeTelegramArg(child);
+      next[key] = normalized;
+      if (normalized !== child) changed = true;
+    }
+    return changed ? next : value;
+  }
+
+  return value;
+}
 
 // Proxy that routes every tg.* call through the rate-limit queue
 // so 429 errors are auto-retried instead of crashing the process.
+// Important: normalize ReadStreams to reusable local paths BEFORE queueing,
+// otherwise a 429 retry resends an already-consumed stream and Telegram may
+// reject it with .
 const tg = new Proxy(tgBot.telegram, {
   get(target, prop: string) {
     const orig = (target as unknown as Record<string, unknown>)[prop];
     if (typeof orig !== 'function') return orig;
-    return (...args: unknown[]) =>
-      tgQueue(() => (orig as (...a: unknown[]) => Promise<unknown>).apply(target, args));
+    return (...args: unknown[]) => {
+      const normalizedArgs = args.map((arg) => normalizeTelegramArg(arg));
+      return tgQueue(() => (orig as (...a: unknown[]) => Promise<unknown>).apply(target, normalizedArgs));
+    };
   },
 }) as typeof tgBot.telegram;
 
@@ -280,6 +317,9 @@ async function resolveUserDisplayName(api: ZaloAPI, uid: string | undefined, fal
   const cleanUid = uid?.trim();
   if (!cleanUid) return fallback;
 
+  const manualOverride = store.getDmNameOverride(cleanUid)?.trim();
+  if (manualOverride) return manualOverride;
+
   const friend = friendsCache.get(cleanUid);
   const contactName = friend?.alias?.trim()
     || friend?.displayName?.trim()
@@ -316,8 +356,45 @@ async function resolveUserDisplayName(api: ZaloAPI, uid: string | undefined, fal
 }
 
 function preferredDmTopicDisplayName(zaloId: string, realName: string): string {
+  const override = store.getDmNameOverride(zaloId)?.trim();
+  if (override) return override;
+
   const displayName = realName.trim() || `Zalo ${zaloId}`;
   return aliasCache.preferredName(zaloId, displayName);
+}
+
+function isUnresolvedDmDisplayName(zaloId: string, displayName: string): boolean {
+  const clean = displayName.trim();
+  return clean === zaloId || clean === `Zalo ${zaloId}`;
+}
+
+async function promptForDmDisplayName(topicId: number, zaloId: string, displayName: string): Promise<void> {
+  if (!isUnresolvedDmDisplayName(zaloId, displayName)) return;
+
+  const pending = pendingNamePromptStore.getPendingNamePrompt(topicId);
+  const promptCooldownMs = 24 * 60 * 60 * 1000;
+  if (pending && Date.now() - pending.createdAt < promptCooldownMs) return;
+
+  try {
+    const sent = await tg.sendMessage(
+      config.telegram.groupId,
+      `❓ <b>Mình chưa xác định được tên hiển thị cho</b> <code>${escapeHtml(zaloId)}</code>.
+` +
+        'Reply tin nhắn này bằng <b>tên bạn muốn dùng</b>.',
+      {
+        message_thread_id: topicId,
+        parse_mode: 'HTML',
+      },
+    );
+    pendingNamePromptStore.setPendingNamePrompt({
+      topicId,
+      zaloId,
+      promptMsgId: sent.message_id,
+      createdAt: Date.now(),
+    });
+  } catch (err) {
+    console.warn(`[Zalo→TG] Failed to send name prompt for topic ${topicId} (${zaloId}):`, err);
+  }
 }
 
 async function maybeRenameExistingDmTopic(
@@ -693,6 +770,9 @@ export async function setupZaloHandler(api: ZaloAPI): Promise<void> {
       }
 
       const topicId = await getOrCreateTopic(zaloId, type, displayName, groupAvatarUrl);
+      if (type === ThreadType.User) {
+        void promptForDmDisplayName(topicId, zaloId, displayName);
+      }
 
       // Resolve Telegram reply target from incoming Zalo quote (if any)
       let tgReplyMsgId: number | undefined;

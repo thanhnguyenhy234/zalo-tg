@@ -12,11 +12,33 @@ export interface TopicEntry {
   name:    string;   // contact name or group name
 }
 
+export interface PendingNamePromptEntry {
+  topicId: number;
+  zaloId: string;
+  promptMsgId: number;
+  createdAt: number;
+}
+
+export interface KpTopicEntry {
+  topicId: number;
+  name: string;
+  url: string;
+  zaloId?: string;
+  type?: 0 | 1;
+  addedAt: number;
+}
+
 interface StoreData {
   /** topicId (as string key) → entry */
   topics:    Record<string, TopicEntry>;
   /** `${type}:${zaloId}` → topicId */
   zaloIndex: Record<string, number>;
+  /** peer UID → manual DM display name override */
+  dmNameOverrides?: Record<string, string>;
+  /** topicId (as string key) → pending name prompt metadata */
+  pendingNamePrompts?: Record<string, PendingNamePromptEntry>;
+  /** topicId (as string key) → tracked khac phuc topics */
+  kpTopics?: Record<string, KpTopicEntry>;
 }
 
 // ── Internal ──────────────────────────────────────────────────────────────────
@@ -58,6 +80,21 @@ export const store = {
     return _data.topics[String(topicId)];
   },
 
+  /** Get the manually confirmed display name for a DM peer, if any. */
+  getDmNameOverride(zaloId: string): string | undefined {
+    return _data.dmNameOverrides?.[zaloId];
+  },
+
+  /** Persist a manual display-name override for a DM peer. */
+  setDmNameOverride(zaloId: string, name: string): void {
+    const cleanName = name.trim();
+    if (!cleanName) return;
+    if (!_data.dmNameOverrides) _data.dmNameOverrides = {};
+    if (_data.dmNameOverrides[zaloId] === cleanName) return;
+    _data.dmNameOverrides[zaloId] = cleanName;
+    persist(_data);
+  },
+
   /** Persist a new topic ↔ Zalo mapping. */
   set(entry: TopicEntry): void {
     _data.topics[String(entry.topicId)] = entry;
@@ -78,6 +115,55 @@ export const store = {
     return Object.values(_data.topics);
   },
 
+  /** Record a pending prompt asking the user to provide a DM display name. */
+  setPendingNamePrompt(entry: PendingNamePromptEntry): void {
+    if (!_data.pendingNamePrompts) _data.pendingNamePrompts = {};
+    _data.pendingNamePrompts[String(entry.topicId)] = entry;
+    persist(_data);
+  },
+
+  /** Look up a pending name prompt by topic ID. */
+  getPendingNamePrompt(topicId: number): PendingNamePromptEntry | undefined {
+    return _data.pendingNamePrompts?.[String(topicId)];
+  },
+
+  /** Clear a pending name prompt for a topic. */
+  clearPendingNamePrompt(topicId: number): void {
+    if (!_data.pendingNamePrompts?.[String(topicId)]) return;
+    delete _data.pendingNamePrompts[String(topicId)];
+    persist(_data);
+  },
+
+  /** Add or update a tracked khac phuc topic. */
+  upsertKpTopic(entry: KpTopicEntry): void {
+    if (!_data.kpTopics) _data.kpTopics = {};
+    _data.kpTopics[String(entry.topicId)] = entry;
+    persist(_data);
+  },
+
+  /** Remove one tracked khac phuc topic by topicId. */
+  removeKpTopic(topicId: number): KpTopicEntry | undefined {
+    const entry = _data.kpTopics?.[String(topicId)];
+    if (!entry) return undefined;
+    delete _data.kpTopics![String(topicId)];
+    persist(_data);
+    return entry;
+  },
+
+  /** Remove all tracked khac phuc topics. */
+  clearAllKpTopics(): number {
+    const count = Object.keys(_data.kpTopics ?? {}).length;
+    if (count === 0) return 0;
+    _data.kpTopics = {};
+    persist(_data);
+    return count;
+  },
+
+  /** List tracked khac phuc topics. */
+  listKpTopics(): KpTopicEntry[] {
+    return Object.values(_data.kpTopics ?? {}).sort((a, b) => a.addedAt - b.addedAt);
+  },
+
   /** Remove a mapping by Telegram topicId. Returns the removed entry or undefined. */
   remove(topicId: number): TopicEntry | undefined {
     const entry = _data.topics[String(topicId)];
@@ -86,6 +172,12 @@ export const store = {
     const key = zaloKey(entry.zaloId, entry.type);
     if (_data.zaloIndex[key] === topicId) {
       delete _data.zaloIndex[key];
+    }
+    if (_data.pendingNamePrompts?.[String(topicId)]) {
+      delete _data.pendingNamePrompts[String(topicId)];
+    }
+    if (_data.kpTopics?.[String(topicId)]) {
+      delete _data.kpTopics[String(topicId)];
     }
     persist(_data);
     return entry;
@@ -96,9 +188,46 @@ export const store = {
     _data = load();
   },
 
-  stats(): { topics: number; sizeBytes: number } {
+  stats(): { topics: number; sizeBytes: number; pendingPrompts: number; overrides: number; kpTopics: number } {
     const raw = JSON.stringify(_data);
-    return { topics: Object.keys(_data.topics).length, sizeBytes: raw.length };
+    return {
+      topics: Object.keys(_data.topics).length,
+      sizeBytes: raw.length,
+      pendingPrompts: Object.keys(_data.pendingNamePrompts ?? {}).length,
+      overrides: Object.keys(_data.dmNameOverrides ?? {}).length,
+      kpTopics: Object.keys(_data.kpTopics ?? {}).length,
+    };
+  },
+};
+
+
+export const pendingNamePromptStore = {
+  getByTopicId(topicId: number): PendingNamePromptEntry | undefined {
+    return store.getPendingNamePrompt(topicId);
+  },
+
+  getPendingNamePrompt(topicId: number): PendingNamePromptEntry | undefined {
+    return store.getPendingNamePrompt(topicId);
+  },
+
+  set(entry: PendingNamePromptEntry): void {
+    store.setPendingNamePrompt(entry);
+  },
+
+  setPendingNamePrompt(entry: PendingNamePromptEntry): void {
+    store.setPendingNamePrompt(entry);
+  },
+
+  clearByTopicId(topicId: number): void {
+    store.clearPendingNamePrompt(topicId);
+  },
+
+  clearPendingNamePrompt(topicId: number): void {
+    store.clearPendingNamePrompt(topicId);
+  },
+
+  stats(): { pendingPrompts: number } {
+    return { pendingPrompts: Object.keys(_data.pendingNamePrompts ?? {}).length };
   },
 };
 

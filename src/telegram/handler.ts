@@ -35,7 +35,7 @@ function splitLongText(text: string): string[] {
 import { promisify } from 'util';
 
 import type { ZaloAPI } from '../zalo/types.js';
-import { store, msgStore, userCache, friendsCache, groupsCache, sentMsgStore, pollStore, mediaGroupStore, reactionEchoStore, reactionSummaryStore, aliasCache, type ZaloQuoteData } from '../store.js';
+import { store, msgStore, userCache, friendsCache, groupsCache, sentMsgStore, pollStore, mediaGroupStore, reactionEchoStore, reactionSummaryStore, aliasCache, pendingNamePromptStore, type ZaloQuoteData } from '../store.js';
 import { tgBot } from './bot.js';
 import { config } from '../config.js';
 import { unreadState } from '../unread-state.js';
@@ -216,6 +216,82 @@ function buildReplyAutoMention(
     prefix: `${mentionText} `,
     mention: { pos: 0, uid: quote.uidFrom, len: mentionText.length },
   };
+}
+
+function normalizeManualDisplayName(raw: string): string {
+  return raw.replace(/\s+/g, ' ').trim();
+}
+
+type ForumTopicIconSticker = {
+  custom_emoji_id?: string;
+  emoji?: string;
+};
+
+function summarizeForumTopicIconChoices(stickers: ForumTopicIconSticker[]): string[] {
+  const lines = stickers.map((sticker, index) => {
+    const emoji = sticker.emoji?.trim() || '❔';
+    const id = sticker.custom_emoji_id?.trim() || 'unknown';
+    return `${index + 1}. ${emoji} <code>${id}</code>`;
+  });
+
+  const chunks: string[] = [];
+  const chunkLimit = 3500;
+  let current = '';
+  for (const line of lines) {
+    const next = current ? `${current}
+${line}` : line;
+    if (next.length > chunkLimit && current) {
+      chunks.push(current);
+      current = line;
+    } else {
+      current = next;
+    }
+  }
+  if (current) chunks.push(current);
+  return chunks;
+}
+
+async function resolveForumTopicIconEmojiId(input: string): Promise<string | null> {
+  const clean = input.trim();
+  if (!clean) return null;
+
+  const stickers = await tgBot.telegram.getForumTopicIconStickers() as ForumTopicIconSticker[];
+  if (/^\d+$/.test(clean)) {
+    const index = Number.parseInt(clean, 10) - 1;
+    const byIndex = stickers[index];
+    if (byIndex?.custom_emoji_id) return byIndex.custom_emoji_id;
+  }
+
+  const byId = stickers.find((sticker) => sticker.custom_emoji_id === clean);
+  if (byId?.custom_emoji_id) return byId.custom_emoji_id;
+
+  const byEmoji = stickers.find((sticker) => sticker.emoji === clean);
+  if (byEmoji?.custom_emoji_id) return byEmoji.custom_emoji_id;
+
+  return null;
+}
+
+async function applyManualDmDisplayName(topicId: number, zaloId: string, requestedName: string): Promise<boolean> {
+  const cleanName = normalizeManualDisplayName(requestedName);
+  if (!cleanName) return false;
+  if (cleanName === zaloId || cleanName === `Zalo ${zaloId}`) return false;
+
+  store.setDmNameOverride(zaloId, cleanName);
+  userCache.save(zaloId, cleanName);
+  aliasCache.merge([{ userId: zaloId, alias: cleanName }]);
+  store.updateName(topicId, cleanName);
+
+  try {
+    await tgBot.telegram.editForumTopic(
+      config.telegram.groupId,
+      topicId,
+      { name: `👤 ${cleanName}`.slice(0, 128) },
+    );
+    return true;
+  } catch (err) {
+    console.warn(`[TG→Zalo] Failed to rename DM topic ${topicId} for ${zaloId}:`, err);
+    return false;
+  }
 }
 
 function normalizePhoneSearchQuery(query: string): string | null {
@@ -755,6 +831,295 @@ export function setupTelegramHandler(
       '❓ Dùng: <code>/topic list</code> | <code>/topic info</code> | <code>/topic delete</code>',
       { ...replyOpts, parse_mode: 'HTML' },
     );
+  });
+
+  tgBot.command('add_kp', async (ctx) => {
+    if (ctx.chat.id !== config.telegram.groupId) return;
+
+    const topicId = 'message_thread_id' in ctx.message
+      ? (ctx.message.message_thread_id as number | undefined)
+      : undefined;
+    const replyOpts = topicId ? { message_thread_id: topicId } : {};
+
+    if (!topicId) {
+      await ctx.telegram.sendMessage(config.telegram.groupId, '⚠️ Lệnh này phải được gửi trong một topic cụ thể.', replyOpts);
+      return;
+    }
+
+    const entry = store.getEntryByTopic(topicId);
+    if (!entry) {
+      await ctx.telegram.sendMessage(config.telegram.groupId, '❌ Topic này chưa được map.', replyOpts);
+      return;
+    }
+
+    const url = buildTopicUrl(topicId);
+    store.upsertKpTopic({
+      topicId,
+      name: entry.name,
+      url,
+      zaloId: entry.zaloId,
+      type: entry.type,
+      addedAt: Date.now(),
+    });
+    await ctx.telegram.sendMessage(
+      config.telegram.groupId,
+      `✅ Đã thêm topic <b>${escapeHtml(entry.name)}</b> vào danh sách khắc phục.
+🔗 <a href="${url}">Mở topic</a>`,
+      { ...replyOpts, parse_mode: 'HTML' },
+    );
+  });
+
+  tgBot.command('list_kp', async (ctx) => {
+    if (ctx.chat.id !== config.telegram.groupId) return;
+
+    const topicId = 'message_thread_id' in ctx.message
+      ? (ctx.message.message_thread_id as number | undefined)
+      : undefined;
+    const replyOpts = topicId ? { message_thread_id: topicId } : {};
+    const entries = store.listKpTopics();
+    if (entries.length === 0) {
+      await ctx.telegram.sendMessage(config.telegram.groupId, '📭 Chưa có topic nào trong danh sách khắc phục.', { ...replyOpts, parse_mode: 'HTML' });
+      return;
+    }
+
+    const refreshedEntries = entries.map((entry) => {
+      const latestTopic = store.getEntryByTopic(entry.topicId);
+      if (!latestTopic || latestTopic.name === entry.name) return entry;
+      const refreshed = { ...entry, name: latestTopic.name, zaloId: latestTopic.zaloId, type: latestTopic.type };
+      store.upsertKpTopic(refreshed);
+      return refreshed;
+    });
+
+    const lines = refreshedEntries.map((entry, index) => `${index + 1}. <a href="${entry.url}">${escapeHtml(entry.name)}</a> <code>(topicId=${entry.topicId})</code>`);
+    const chunks: string[] = [];
+    let current = `📋 <b>Danh sách topic khắc phục</b> (${entries.length}):
+`;
+    for (const line of lines) {
+      const next = `${current}
+${line}`;
+      if (next.length > 3500 && current) {
+        chunks.push(current);
+        current = line;
+      } else {
+        current = next;
+      }
+    }
+    if (current) chunks.push(current);
+
+    for (const chunk of chunks) {
+      await ctx.telegram.sendMessage(
+        config.telegram.groupId,
+        chunk,
+        { ...replyOpts, parse_mode: 'HTML' },
+      );
+    }
+  });
+
+  tgBot.command('clear_all_kp', async (ctx) => {
+    if (ctx.chat.id !== config.telegram.groupId) return;
+
+    const topicId = 'message_thread_id' in ctx.message
+      ? (ctx.message.message_thread_id as number | undefined)
+      : undefined;
+    const replyOpts = topicId ? { message_thread_id: topicId } : {};
+    const count = store.clearAllKpTopics();
+    await ctx.telegram.sendMessage(
+      config.telegram.groupId,
+      count > 0
+        ? `🧹 Đã xoá toàn bộ ${count} topic khỏi danh sách khắc phục.`
+        : '📭 Danh sách khắc phục đang trống.',
+      { ...replyOpts, parse_mode: 'HTML' },
+    );
+  });
+
+  tgBot.command('clear_kp', async (ctx) => {
+    if (ctx.chat.id !== config.telegram.groupId) return;
+
+    const topicId = 'message_thread_id' in ctx.message
+      ? (ctx.message.message_thread_id as number | undefined)
+      : undefined;
+    const replyOpts = topicId ? { message_thread_id: topicId } : {};
+
+    if (!topicId) {
+      await ctx.telegram.sendMessage(config.telegram.groupId, '⚠️ Lệnh này phải được gửi trong một topic cụ thể.', replyOpts);
+      return;
+    }
+
+    const removed = store.removeKpTopic(topicId);
+    await ctx.telegram.sendMessage(
+      config.telegram.groupId,
+      removed
+        ? `🗑️ Đã xoá topic <b>${escapeHtml(removed.name)}</b> khỏi danh sách khắc phục.`
+        : 'ℹ️ Topic hiện tại chưa có trong danh sách khắc phục.',
+      { ...replyOpts, parse_mode: 'HTML' },
+    );
+  });
+
+  tgBot.command('set_topic_name', async (ctx) => {
+    if (ctx.chat.id !== config.telegram.groupId) return;
+
+    const topicId = 'message_thread_id' in ctx.message
+      ? (ctx.message.message_thread_id as number | undefined)
+      : undefined;
+    const replyOpts = topicId ? { message_thread_id: topicId } : {};
+
+    if (!topicId) {
+      await ctx.telegram.sendMessage(
+        config.telegram.groupId,
+        '⚠️ Lệnh này phải được gửi trong một topic cụ thể.',
+        replyOpts,
+      );
+      return;
+    }
+
+    const entry = store.getEntryByTopic(topicId);
+    if (!entry) {
+      await ctx.telegram.sendMessage(
+        config.telegram.groupId,
+        '❌ Topic này chưa được map.',
+        replyOpts,
+      );
+      return;
+    }
+
+    if (entry.type !== 0) {
+      await ctx.telegram.sendMessage(
+        config.telegram.groupId,
+        '⚠️ /set_topic_name hiện chỉ áp dụng cho topic DM.',
+        replyOpts,
+      );
+      return;
+    }
+
+    const requestedName = normalizeManualDisplayName(
+      (ctx.message.text ?? '').replace(/^\/set_topic_name(?:@[A-Za-z0-9_]+)?\s*/i, ''),
+    );
+    if (!requestedName) {
+      await ctx.telegram.sendMessage(
+        config.telegram.groupId,
+        '⚠️ Dùng: <code>/set_topic_name Tên mới</code>',
+        { ...replyOpts, parse_mode: 'HTML' },
+      );
+      return;
+    }
+
+    const applied = await applyManualDmDisplayName(topicId, entry.zaloId, requestedName);
+    pendingNamePromptStore.clearPendingNamePrompt(topicId);
+    await ctx.telegram.sendMessage(
+      config.telegram.groupId,
+      applied
+        ? `✅ Đã đổi tên topic thành <b>${escapeHtml(requestedName)}</b>.`
+        : `⚠️ Đã lưu tên <b>${escapeHtml(requestedName)}</b> nhưng không đổi được tên topic trên Telegram.`,
+      { ...replyOpts, parse_mode: 'HTML' },
+    );
+  });
+
+  tgBot.command('set_topic_color', async (ctx) => {
+    if (ctx.chat.id !== config.telegram.groupId) return;
+
+    const topicId = 'message_thread_id' in ctx.message
+      ? (ctx.message.message_thread_id as number | undefined)
+      : undefined;
+    const replyOpts = topicId ? { message_thread_id: topicId } : {};
+
+    await ctx.telegram.sendMessage(
+      config.telegram.groupId,
+      'ℹ️ Telegram hiện không hỗ trợ đổi <b>icon_color</b> của topic sau khi đã tạo. ' +
+        'Bot chỉ đổi được màu lúc <b>createForumTopic</b>; còn topic đã có chỉ sửa được tên hoặc <b>icon_custom_emoji_id</b>.',
+      { ...replyOpts, parse_mode: 'HTML' },
+    );
+  });
+
+  tgBot.command('set_topic_icon_emoji', async (ctx) => {
+    if (ctx.chat.id !== config.telegram.groupId) return;
+
+    const topicId = 'message_thread_id' in ctx.message
+      ? (ctx.message.message_thread_id as number | undefined)
+      : undefined;
+    const replyOpts = topicId ? { message_thread_id: topicId } : {};
+
+    if (!topicId) {
+      await ctx.telegram.sendMessage(
+        config.telegram.groupId,
+        '⚠️ Lệnh này phải được gửi trong một topic cụ thể.',
+        replyOpts,
+      );
+      return;
+    }
+
+    const rawArg = (ctx.message.text ?? '').replace(/^\/set_topic_icon_emoji(?:@[A-Za-z0-9_]+)?\s*/i, '').trim();
+    if (!rawArg || rawArg.toLowerCase() === 'list') {
+      const stickers = await ctx.telegram.getForumTopicIconStickers() as ForumTopicIconSticker[];
+      const chunks = summarizeForumTopicIconChoices(stickers);
+      if (chunks.length === 0) {
+        await ctx.telegram.sendMessage(
+          config.telegram.groupId,
+          'ℹ️ Không lấy được danh sách topic icon từ Telegram lúc này.',
+          { ...replyOpts, parse_mode: 'HTML' },
+        );
+        return;
+      }
+
+      for (const [index, chunk] of chunks.entries()) {
+        const header = index === 0
+          ? `ℹ️ Dùng <code>/set_topic_icon_emoji &lt;emoji hoặc custom_emoji_id&gt;</code>.
+
+Toàn bộ icon hỗ trợ (${stickers.length}):
+`
+          : `ℹ️ Icon hỗ trợ (tiếp ${index + 1}/${chunks.length}):
+`;
+        await ctx.telegram.sendMessage(
+          config.telegram.groupId,
+          `${header}${chunk}`,
+          { ...replyOpts, parse_mode: 'HTML' },
+        );
+      }
+      return;
+    }
+
+    const normalized = rawArg.toLowerCase();
+    if (normalized == 'none' || normalized == 'clear' || normalized == 'remove') {
+      try {
+        await ctx.telegram.editForumTopic(config.telegram.groupId, topicId, { icon_custom_emoji_id: '' });
+        await ctx.telegram.sendMessage(
+          config.telegram.groupId,
+          '✅ Đã gỡ custom emoji icon của topic.',
+          { ...replyOpts, parse_mode: 'HTML' },
+        );
+      } catch (err) {
+        await ctx.telegram.sendMessage(
+          config.telegram.groupId,
+          `❌ Không gỡ được topic icon: <code>${escapeHtml(err instanceof Error ? err.message : String(err))}</code>`,
+          { ...replyOpts, parse_mode: 'HTML' },
+        );
+      }
+      return;
+    }
+
+    const iconId = await resolveForumTopicIconEmojiId(rawArg);
+    if (!iconId) {
+      await ctx.telegram.sendMessage(
+        config.telegram.groupId,
+        '⚠️ Không tìm thấy topic icon hợp lệ. Dùng <code>/set_topic_icon_emoji list</code> để xem danh sách hỗ trợ và số thứ tự.',
+        { ...replyOpts, parse_mode: 'HTML' },
+      );
+      return;
+    }
+
+    try {
+      await ctx.telegram.editForumTopic(config.telegram.groupId, topicId, { icon_custom_emoji_id: iconId });
+      await ctx.telegram.sendMessage(
+        config.telegram.groupId,
+        `✅ Đã đổi topic icon sang <code>${escapeHtml(iconId)}</code>.`,
+        { ...replyOpts, parse_mode: 'HTML' },
+      );
+    } catch (err) {
+      await ctx.telegram.sendMessage(
+        config.telegram.groupId,
+        `❌ Không đổi được topic icon: <code>${escapeHtml(err instanceof Error ? err.message : String(err))}</code>`,
+        { ...replyOpts, parse_mode: 'HTML' },
+      );
+    }
   });
 
   tgBot.command('recall', async (ctx) => {
@@ -2227,12 +2592,32 @@ export function setupTelegramHandler(
       };
 
       if ('text' in msg && msg.text) {
+        const replyToMsgId = msg.reply_to_message?.message_id;
+        const pendingNamePrompt = pendingNamePromptStore.getPendingNamePrompt(topicId);
+        if (pendingNamePrompt && replyToMsgId === pendingNamePrompt.promptMsgId) {
+          const requestedName = normalizeManualDisplayName(msg.text);
+          if (!requestedName) {
+            await ctx.reply('⚠️ Vui lòng reply bằng tên không được để trống.');
+            return;
+          }
+
+          const applied = await applyManualDmDisplayName(topicId, pendingNamePrompt.zaloId, requestedName);
+          pendingNamePromptStore.clearPendingNamePrompt(topicId);
+          await ctx.telegram.sendMessage(
+            config.telegram.groupId,
+            applied
+              ? `✅ Đã lưu tên <b>${escapeHtml(requestedName)}</b> cho <code>${escapeHtml(pendingNamePrompt.zaloId)}</code>.`
+              : `⚠️ Đã lưu tên <b>${escapeHtml(requestedName)}</b> cho <code>${escapeHtml(pendingNamePrompt.zaloId)}</code>, nhưng không đổi được tên topic trên Telegram.`,
+            { message_thread_id: topicId, parse_mode: 'HTML' },
+          );
+          return;
+        }
+
         // Skip bot commands that were already handled above
         if (msg.text.startsWith('/')) return;
         console.log(`[TG→Zalo] sendMessage → zaloId=${zaloId} type=${threadType} text="${msg.text.slice(0, 80)}"`);
         // Look up Zalo quote data if this TG message is a reply.
         // Tries msgStore (Zalo→TG) first, then sentMsgStore (TG→Zalo).
-        const replyToMsgId = msg.reply_to_message?.message_id;
         const zaloQuote = getZaloQuote(replyToMsgId);
 
         const _rawTextMentions = resolveTgMentions(

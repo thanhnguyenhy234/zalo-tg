@@ -1,7 +1,7 @@
 import { execSync } from 'child_process';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import type { Telegraf } from 'telegraf';
+import type { Telegraf, Telegram } from 'telegraf';
 
 import { config } from './config.js';
 
@@ -52,12 +52,12 @@ export function startUpdateChecker(bot: Telegraf): void {
       await ctx.answerCbQuery('⏳ Đang cập nhật...').catch(() => undefined);
 
       await ctx.editMessageText(
-        '⏳ <b>Đang cập nhật...</b>\n\ngit pull origin main...',
+        '⏳ <b>Đang cập nhật...</b>\n\ngit pull...',
         { parse_mode: 'HTML' },
       ).catch(() => undefined);
 
-      // 1. git pull
-      execSync('git pull origin main', { cwd: PROJECT_ROOT, stdio: 'pipe', timeout: 120_000 });
+      // 1. git pull (--autostash handles unstaged changes when pull.rebase=true)
+      execSync('git pull --autostash origin main', { cwd: PROJECT_ROOT, stdio: 'pipe', timeout: 120_000 });
 
       await ctx.editMessageText(
         '⏳ <b>Đang cập nhật...</b>\n\n✅ git pull\nnpm install...',
@@ -103,40 +103,54 @@ export function startUpdateChecker(bot: Telegraf): void {
   });
 
   // ── Periodic check ──────────────────────────────────────────────────────
-  const check = async () => {
+  const autoCheck = async () => {
     const commit = getNewCommit();
     if (!commit) return;
     if (_notifiedCommit === commit) return;
-
-    _notifiedCommit = commit;
-    const changelog = getChangelog();
-
-    try {
-      await bot.telegram.sendMessage(
-        config.telegram.groupId,
-        `🔔 <b>Có bản cập nhật mới!</b> (<code>${commit}</code>)\n\n${
-          changelog
-            ? changelog.split('\n').slice(0, 10).map(l => `• ${l}`).join('\n')
-            : ''
-        }`,
-        {
-          parse_mode: 'HTML',
-          reply_markup: {
-            inline_keyboard: [
-              [
-                { text: '🔄 Cập nhật ngay', callback_data: 'upd:confirm' },
-                { text: '⏰ Để sau',         callback_data: 'upd:skip' },
-              ],
-            ],
-          },
-        },
-      );
-    } catch (err) {
-      console.error('[Updater] Failed to send notification:', err);
-      _notifiedCommit = null;
-    }
+    await sendUpdateNotification(bot.telegram, commit);
   };
 
-  setTimeout(check, 60_000);
-  setInterval(check, 10 * 60_000);
+  setTimeout(autoCheck, 60_000);
+  setInterval(autoCheck, 10 * 60_000);
+}
+
+/** Send update notification with inline buttons to the configured group. */
+async function sendUpdateNotification(tg: Telegram, commit: string): Promise<void> {
+  _notifiedCommit = commit;
+  const changelog = getChangelog();
+  try {
+    await tg.sendMessage(
+      config.telegram.groupId,
+      `🔔 <b>Có bản cập nhật mới!</b> (<code>${commit}</code>)\n\n${
+        changelog
+          ? changelog.split('\n').slice(0, 10).map(l => `• ${l}`).join('\n')
+          : ''
+      }`,
+      {
+        parse_mode: 'HTML',
+        reply_markup: {
+          inline_keyboard: [
+            [
+              { text: '🔄 Cập nhật ngay', callback_data: 'upd:confirm' },
+              { text: '⏰ Để sau',         callback_data: 'upd:skip' },
+            ],
+          ],
+        },
+      },
+    );
+  } catch (err) {
+    console.error('[Updater] Failed to send notification:', err);
+    _notifiedCommit = null;
+  }
+}
+
+/**
+ * Manual trigger — call from /update command.
+ * Returns true if a new update was found and notified.
+ */
+export async function triggerUpdateCheck(tg: Telegram): Promise<boolean> {
+  const commit = getNewCommit();
+  if (!commit) return false;
+  await sendUpdateNotification(tg, commit);
+  return true;
 }

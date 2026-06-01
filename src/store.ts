@@ -89,10 +89,21 @@ export const store = {
   setDmNameOverride(zaloId: string, name: string): void {
     const cleanName = name.trim();
     if (!cleanName) return;
+
+    let changed = false;
     if (!_data.dmNameOverrides) _data.dmNameOverrides = {};
-    if (_data.dmNameOverrides[zaloId] === cleanName) return;
-    _data.dmNameOverrides[zaloId] = cleanName;
-    persist(_data);
+    if (_data.dmNameOverrides[zaloId] !== cleanName) {
+      _data.dmNameOverrides[zaloId] = cleanName;
+      changed = true;
+    }
+
+    for (const entry of Object.values(_data.topics)) {
+      if (entry.type !== 0 || entry.zaloId !== zaloId || entry.name === cleanName) continue;
+      entry.name = cleanName;
+      changed = true;
+    }
+
+    if (changed) persist(_data);
   },
 
   /** Persist a new topic ↔ Zalo mapping. */

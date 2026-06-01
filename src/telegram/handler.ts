@@ -989,7 +989,12 @@ ${line}`;
       );
       iconUpdated = true;
     } catch (err) {
-      console.warn(`[KP] Failed to reset topic icon for topicId=${topicId}:`, err);
+      const message = err instanceof Error ? err.message : String(err);
+      if (message.includes('TOPIC_NOT_MODIFIED')) {
+        iconUpdated = true;
+      } else {
+        console.warn('[KP] Failed to reset topic icon for topicId=' + topicId + ':', err);
+      }
     }
 
     await ctx.telegram.sendMessage(

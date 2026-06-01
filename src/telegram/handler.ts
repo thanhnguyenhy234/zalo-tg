@@ -922,12 +922,37 @@ ${line}`;
       ? (ctx.message.message_thread_id as number | undefined)
       : undefined;
     const replyOpts = topicId ? { message_thread_id: topicId } : {};
-    const count = store.clearAllKpTopics();
+    const entries = store.listKpTopics();
+    if (entries.length === 0) {
+      await ctx.telegram.sendMessage(
+        config.telegram.groupId,
+        '📭 Danh sách khắc phục đang trống.',
+        { ...replyOpts, parse_mode: 'HTML' },
+      );
+      return;
+    }
+
+    store.clearAllKpTopics();
+
+    let iconUpdated = 0;
+    for (const entry of entries) {
+      try {
+        await ctx.telegram.editForumTopic(
+          config.telegram.groupId,
+          entry.topicId,
+          { icon_custom_emoji_id: '5420216386448270341' },
+        );
+        iconUpdated += 1;
+      } catch (err) {
+        console.warn(`[KP] Failed to reset topic icon for topicId=${entry.topicId}:`, err);
+      }
+    }
+
     await ctx.telegram.sendMessage(
       config.telegram.groupId,
-      count > 0
-        ? `🧹 Đã xoá toàn bộ ${count} topic khỏi danh sách khắc phục.`
-        : '📭 Danh sách khắc phục đang trống.',
+      iconUpdated === entries.length
+        ? `🧹 Đã xoá toàn bộ ${entries.length} topic khỏi danh sách khắc phục và đổi icon cho tất cả.`
+        : `🧹 Đã xoá toàn bộ ${entries.length} topic khỏi danh sách khắc phục; đổi icon thành công ${iconUpdated}/${entries.length} topic.`,
       { ...replyOpts, parse_mode: 'HTML' },
     );
   });
@@ -946,11 +971,32 @@ ${line}`;
     }
 
     const removed = store.removeKpTopic(topicId);
+    if (!removed) {
+      await ctx.telegram.sendMessage(
+        config.telegram.groupId,
+        'ℹ️ Topic hiện tại chưa có trong danh sách khắc phục.',
+        { ...replyOpts, parse_mode: 'HTML' },
+      );
+      return;
+    }
+
+    let iconUpdated = false;
+    try {
+      await ctx.telegram.editForumTopic(
+        config.telegram.groupId,
+        topicId,
+        { icon_custom_emoji_id: '5420216386448270341' },
+      );
+      iconUpdated = true;
+    } catch (err) {
+      console.warn(`[KP] Failed to reset topic icon for topicId=${topicId}:`, err);
+    }
+
     await ctx.telegram.sendMessage(
       config.telegram.groupId,
-      removed
-        ? `🗑️ Đã xoá topic <b>${escapeHtml(removed.name)}</b> khỏi danh sách khắc phục.`
-        : 'ℹ️ Topic hiện tại chưa có trong danh sách khắc phục.',
+      iconUpdated
+        ? `🗑️ Đã xoá topic <b>${escapeHtml(removed.name)}</b> khỏi danh sách khắc phục và đổi icon topic.`
+        : `🗑️ Đã xoá topic <b>${escapeHtml(removed.name)}</b> khỏi danh sách khắc phục, nhưng chưa đổi được icon topic.`,
       { ...replyOpts, parse_mode: 'HTML' },
     );
   });

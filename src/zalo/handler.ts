@@ -12,7 +12,7 @@ import { config } from '../config.js';
 import { downloadToTemp, cleanTemp } from '../utils/media.js';
 import { applyZaloMarkupHtml, formatGroupMsgHtml, formatGroupMsg, groupCaption, topicName, truncate, escapeHtml } from '../utils/format.js';
 import type { ZaloStyle } from '../utils/format.js';
-import { msgStore, userCache, pollStore, sentMsgStore, zaloAlbumStore, reactionEchoStore, reactionSummaryStore, aliasCache, friendsCache, pendingNamePromptStore, type ZaloQuoteData } from '../store.js';
+import { msgStore, userCache, pollStore, sentMsgStore, zaloAlbumStore, reactionEchoStore, reactionSummaryStore, aliasCache, friendsCache, pendingNamePromptStore, recentlyRecalledMsgIds, type ZaloQuoteData } from '../store.js';
 import { tgQueue } from '../utils/tgQueue.js';
 
 function normalizeTelegramArg(value: unknown): unknown {
@@ -594,6 +594,28 @@ async function warmGroupMemberCache(api: ZaloAPI, groupId: string): Promise<void
  * before any of them is saved to msgStore, causing all to pass the msgStore check.
  */
 const _inFlightMsgIds = new Set<string>();
+const _recentMediaFingerprints = new Set<string>();
+const rememberRecentMediaFingerprint = (fingerprint: string) => {
+  _recentMediaFingerprints.add(fingerprint);
+  setTimeout(() => _recentMediaFingerprints.delete(fingerprint), 15_000);
+};
+const buildRecentMediaFingerprint = ({
+  threadId,
+  senderId,
+  msgType,
+  cliMsgId,
+  href,
+  title,
+}: {
+  threadId?: string | number;
+  senderId?: string | number;
+  msgType?: string | number;
+  cliMsgId?: string | number;
+  href?: string;
+  title?: string;
+}) => [threadId, senderId, msgType, cliMsgId || href || title]
+  .map(value => String(value ?? ''))
+  .join('::');
 
 export async function setupZaloHandler(api: ZaloAPI): Promise<void> {
   // Pre-populate userCache for all existing group topics on startup.
@@ -1055,6 +1077,21 @@ ${escapeHtml(photoCaption)}`
           console.warn('[ZaloHandler] File: no URL found in content:', media);
           return;
         }
+
+        const recentFileFingerprint = buildRecentMediaFingerprint({
+          threadId: msg.threadId,
+          senderId: msg.data.uidFrom,
+          msgType: msg.data.msgType,
+          cliMsgId: msg.data.cliMsgId,
+          href: url,
+          title: media.title,
+        });
+        if (_recentMediaFingerprints.has(recentFileFingerprint)) {
+          console.log(`[ZaloHandler] Skip duplicate file re-emit fingerprint=${recentFileFingerprint} msgId=${msg.data.msgId}`);
+          return;
+        }
+        rememberRecentMediaFingerprint(recentFileFingerprint);
+
         const localPath = await (earlyDlPromise ?? downloadToTemp(url, fileName));
         const stream = createReadStream(localPath);
         try {
@@ -1655,6 +1692,12 @@ ${escapeHtml(photoCaption)}`
       const zaloMsgId = rawMsgId;
       if (!zaloMsgId) {
         console.log(`[ZaloHandler] Undo: could not resolve msgId, raw undo data:`, JSON.stringify(data));
+        return;
+      }
+
+      // Skip notification if we just initiated this recall from Telegram (prevents duplicate "🗑" message)
+      if (recentlyRecalledMsgIds.has(zaloMsgId)) {
+        console.log(`[ZaloHandler] Undo: skip notification for recently-recalled msgId=${zaloMsgId}`);
         return;
       }
 

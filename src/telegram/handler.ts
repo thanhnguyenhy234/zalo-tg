@@ -35,7 +35,7 @@ function splitLongText(text: string): string[] {
 import { promisify } from 'util';
 
 import type { ZaloAPI } from '../zalo/types.js';
-import { store, msgStore, userCache, friendsCache, groupsCache, sentMsgStore, pollStore, mediaGroupStore, reactionEchoStore, reactionSummaryStore, aliasCache, pendingNamePromptStore, type ZaloQuoteData } from '../store.js';
+import { store, msgStore, userCache, friendsCache, groupsCache, sentMsgStore, pollStore, mediaGroupStore, reactionEchoStore, reactionSummaryStore, aliasCache, pendingNamePromptStore, markRecalled, type ZaloQuoteData } from '../store.js';
 import { tgBot } from './bot.js';
 import { config } from '../config.js';
 import { unreadState } from '../unread-state.js';
@@ -1332,30 +1332,52 @@ Toàn bộ icon hỗ trợ (${stickers.length}):
       return;
     }
 
-    // Look up from sentMsgStore (TG→Zalo messages we sent)
+    // 1. Try sentMsgStore (TG->Zalo messages we sent)
     const sent = sentMsgStore.get(replyTo.message_id);
-    if (!sent) {
-      await ctx.reply('❌ Không tìm thấy tin nhắn đã gửi (chỉ thu hồi được tin mình gửi từ Telegram, và chỉ trong 300 tin gần nhất)');
+    if (sent) {
+      const { ThreadType } = await import('zca-js');
+      const zaloThreadType = sent.threadType === 1 ? ThreadType.Group : ThreadType.User;
+
+      try {
+        let recalled = 0;
+        for (const mid of sent.msgIds) {
+          await currentApi.undo(
+            { msgId: mid, cliMsgId: 0 },
+            sent.zaloId,
+            zaloThreadType,
+          );
+          markRecalled(String(mid));
+          recalled++;
+        }
+        console.log(`[TG→Zalo] Recall ${recalled} msgIds=[${sent.msgIds}] zaloId=${sent.zaloId}`);
+        await ctx.reply(`✅ Đã thu hồi ${recalled} tin nhắn trên Zalo`);
+      } catch (err) {
+        console.error('[TG→Zalo] Recall error:', err);
+        await ctx.reply(`❌ Thu hồi thất bại: ${err instanceof Error ? err.message : String(err)}`);
+      }
+      return;
+    }
+
+    // 2. Fallback: try msgStore (Zalo->TG forwarded messages)
+    const quote = msgStore.getQuote(replyTo.message_id);
+    if (!quote) {
+      await ctx.reply('❌ Không tìm thấy tin nhắn đã gửi (chỉ thu hồi được tin mình gửi từ Telegram hoặc tin từ Zalo đã forward)');
       return;
     }
 
     const { ThreadType } = await import('zca-js');
-    const zaloThreadType = sent.threadType === 1 ? ThreadType.Group : ThreadType.User;
-
+    const zaloThreadType = quote.threadType === 1 ? ThreadType.Group : ThreadType.User;
     try {
-      let recalled = 0;
-      for (const mid of sent.msgIds) {
-        await currentApi.undo(
-          { msgId: mid, cliMsgId: 0 },
-          sent.zaloId,
-          zaloThreadType,
-        );
-        recalled++;
-      }
-      console.log(`[TG→Zalo] Recall ${recalled} msgIds=[${sent.msgIds}] zaloId=${sent.zaloId}`);
-      await ctx.reply(`✅ Đã thu hồi ${recalled} tin nhắn trên Zalo`);
+      await currentApi.undo(
+        { msgId: Number(quote.msgId), cliMsgId: quote.cliMsgId ? Number(quote.cliMsgId) : 0 },
+        quote.zaloId,
+        zaloThreadType,
+      );
+      markRecalled(quote.msgId);
+      console.log(`[TG→Zalo] Recall msgId=${quote.msgId} zaloId=${quote.zaloId} (Zalo->TG)`);
+      await ctx.reply('✅ Đã thu hồi tin nhắn trên Zalo');
     } catch (err) {
-      console.error('[TG→Zalo] Recall error:', err);
+      console.error('[TG→Zalo] Recall error (Zalo->TG):', err);
       await ctx.reply(`❌ Thu hồi thất bại: ${err instanceof Error ? err.message : String(err)}`);
     }
   });
@@ -3492,8 +3514,11 @@ sentMsgStore.save(msg.message_id, { msgIds: [zaloMsgId], zaloId, threadType });
         const { latitude, longitude } = msg.location;
         const venue = ('venue' in msg && msg.venue) ? (msg.venue as { title?: string; address?: string }) : undefined;
         const mapsUrl = `https://www.google.com/maps?q=${latitude},${longitude}`;
-        const locationLabel = venue?.title
-          ? `📍 ${venue.title}${venue.address ? ` — ${venue.address}` : ''}\n${mapsUrl}`
+        const topicLocationName = entry.name.replace(/^👤\s*/, '').trim();
+        const locationTitle = venue?.title?.trim() || topicLocationName;
+        const locationAddress = venue?.address?.trim();
+        const locationLabel = locationTitle
+          ? `📍 ${locationTitle}${locationAddress ? ` — ${locationAddress}` : ''}\n${mapsUrl}`
           : `📍 ${mapsUrl}`;
         sentMsgStore.markSending(zaloId);
         try {

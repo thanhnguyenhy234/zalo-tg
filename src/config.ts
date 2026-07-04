@@ -50,4 +50,6 @@ export const config = {
     skipMutedGroups: envFlag('ZALO_SKIP_MUTED_GROUPS'),
   },
   dataDir: resolvePath(process.env.DATA_DIR, 'data'),
+  /** Tắt tự động đổi tên Telegram topic theo tên Zalo. */
+  disableAutoTopicRename: envFlag('DISABLE_AUTO_TOPIC_RENAME'),
 } as const;

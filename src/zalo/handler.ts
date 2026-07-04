@@ -403,7 +403,7 @@ async function maybeRenameExistingDmTopic(
   displayName: string,
 ): Promise<void> {
   const entry = store.getEntryByTopic(topicId);
-  if (!entry || entry.type !== ThreadType.User || entry.name === displayName) return;
+  if (config.disableAutoTopicRename || !entry || entry.type !== ThreadType.User || entry.name === displayName) return;
 
   const nextName = topicName(displayName, ThreadType.User);
   try {
@@ -1988,6 +1988,10 @@ ${escapeHtml(photoCaption)}`
       // ── Group name change: update TG topic name ────────────────────────────────────────
       // Zalo sends act="update" (type="update") when group is renamed, with groupName in data.
       // act="update_setting" is kept as fallback.
+      if (config.disableAutoTopicRename) {
+        console.log(`[ZaloHandler] GroupEvent ${type}: auto topic rename is disabled — keeping topic name`);
+        return;
+      }
       if (type === 'update' || type === 'update_setting') {
         const newName: string = (
           (data?.groupName as string | undefined) ??

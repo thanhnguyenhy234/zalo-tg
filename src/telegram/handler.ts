@@ -1639,22 +1639,12 @@ Toàn bộ icon hỗ trợ (${stickers.length}):
         );
       }
 
-      const metaLines = [
-        requestId ? `<code>REQUEST_ID=${escapeHtml(requestId)}</code>` : '',
-        `<code>TOPIC_STATUS=${topic.status}</code>`,
-        `<code>TOPIC_ID=${topic.topicId}</code>`,
-        `<code>TOPIC_URL=${escapeHtml(topic.url)}</code>`,
-        `<code>ZALO_UID=${escapeHtml(topic.userId)}</code>`,
-        payloadMessage ? '<code>PAYLOAD_SENT=1</code>' : '',
-      ].filter(Boolean);
-
       await ctx.telegram.sendMessage(
         ctx.chat.id,
         [
           `✅ Topic sẵn sàng cho <b>${escapeHtml(topic.displayName)}</b>.`,
           `📱 <code>${phoneQuery}</code>`,
-          '',
-          ...metaLines,
+          `🔗 <code>${escapeHtml(topic.url)}</code>`,
         ].join('\n'),
         {
           ...replyOpts,

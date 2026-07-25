@@ -32,7 +32,10 @@ const BOT_COMMANDS = [
 ];
 
 /** Singleton Telegraf bot instance shared across the app. */
+// QR /login can run for several minutes (QR refresh + phone confirm).
+// Default Telegraf handlerTimeout is 90s and aborts the handler mid-login.
 export const tgBot = new Telegraf(config.telegram.token, {
+  handlerTimeout: 15 * 60 * 1000,
   telegram: config.telegram.localServer
     ? { apiRoot: config.telegram.localServer, agent: localAgent }
     : { agent },

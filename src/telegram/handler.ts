@@ -660,6 +660,51 @@ async function ensureDmTopicForUser(user: OpenPhoneSearchUser): Promise<EnsuredD
 /** Track in-progress QR login so we don't stack multiple flows. */
 let qrLoginInProgress = false;
 
+/** True while /login QR flow is running (used to suppress expected kick noise). */
+export function isQrLoginInProgress(): boolean {
+  return qrLoginInProgress;
+}
+
+/** Rate-limit "Zalo not connected" notices per topic (ms). */
+const ZALO_NOT_READY_NOTICE_COOLDOWN_MS = 30_000;
+const zaloNotReadyNoticeAt = new Map<number, number>();
+
+/**
+ * Wait briefly for Zalo API to become ready (covers boot race / reconnect window).
+ * Returns the API once available, or null if still unavailable after timeout.
+ */
+async function waitForZaloApi(
+  getApi: () => ZaloAPI | null,
+  timeoutMs = 30_000,
+  pollMs = 250,
+): Promise<ZaloAPI | null> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const api = getApi();
+    if (api) return api;
+    await new Promise((r) => setTimeout(r, pollMs));
+  }
+  return getApi();
+}
+
+async function notifyZaloNotReady(topicId: number, reason: string): Promise<void> {
+  const now = Date.now();
+  const last = zaloNotReadyNoticeAt.get(topicId) ?? 0;
+  if (now - last < ZALO_NOT_READY_NOTICE_COOLDOWN_MS) return;
+  zaloNotReadyNoticeAt.set(topicId, now);
+  console.warn(`[TG→Zalo] ${reason} (topicId=${topicId})`);
+  const hint = qrLoginInProgress
+    ? 'Đang đăng nhập QR Zalo — gửi lại tin sau khi login xong.'
+    : 'Zalo chưa kết nối. Dùng /login nếu cần, rồi gửi lại tin này.';
+  await tgBot.telegram
+    .sendMessage(
+      config.telegram.groupId,
+      `⚠️ <b>Chưa gửi sang Zalo</b>\n${hint}`,
+      { message_thread_id: topicId, parse_mode: 'HTML' },
+    )
+    .catch(() => undefined);
+}
+
 /**
  * Start a Zalo QR login flow and forward the QR image + status messages
  * back to the Telegram chat/topic where /login was sent.
@@ -2765,14 +2810,16 @@ Toàn bộ icon hỗ trợ (${stickers.length}):
         'message_thread_id' in msg ? (msg.message_thread_id as number | undefined) : undefined;
       if (!topicId) return;
 
-      // Zalo not connected yet
-      if (!currentApi) {
-        console.warn('[TG→Zalo] currentApi is null – Zalo not connected. Ignoring message.');
+      // Wait for Zalo during boot/reconnect instead of silently dropping.
+      let api = currentApi;
+      if (!api) {
+        console.warn('[TG→Zalo] currentApi is null – waiting up to 30s for Zalo...');
+        api = await waitForZaloApi(() => currentApi, 30_000);
+      }
+      if (!api) {
+        await notifyZaloNotReady(topicId, 'Zalo still not connected after wait – message not forwarded');
         return;
       }
-
-      // Capture api reference so closures below always use the same instance
-      const api = currentApi;
 
       // Look up the corresponding Zalo conversation
       const entry = store.getEntryByTopic(topicId);

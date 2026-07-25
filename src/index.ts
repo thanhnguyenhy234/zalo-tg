@@ -2,7 +2,7 @@ import { getZaloApi, resetZaloApi } from './zalo/client.js';
 import { CloseReason, ThreadType } from 'zca-js';
 import { setupZaloHandler } from './zalo/handler.js';
 import { tgBot, syncTelegramCommands } from './telegram/bot.js';
-import { setupTelegramHandler } from './telegram/handler.js';
+import { setupTelegramHandler, isQrLoginInProgress } from './telegram/handler.js';
 import { config } from './config.js';
 import { startUpdateChecker } from './updater.js';
 import { store } from './store.js';
@@ -150,6 +150,11 @@ async function startZalo(
       return;
     }
     if (code === CloseReason.KickConnection) {
+      // Expected when /login completes: the new QR session kicks the old worker.
+      if (isQrLoginInProgress()) {
+        console.warn(`[Boot] Zalo kicked during /login (expected): code=${code}, reason=${reason}`);
+        return;
+      }
       console.warn(`[Boot] Zalo disconnected: kicked connection (code=${code}, reason=${reason})`);
       tgBot.telegram.sendMessage(
         config.telegram.groupId,
@@ -180,6 +185,22 @@ async function main(): Promise<void> {
   });
   _setZaloApi = setZaloApi;
 
+  // Connect Zalo BEFORE launching Telegram so backlog updates are not
+  // processed while currentApi is still null (silent TG→Zalo drops).
+  let zaloReadyAtBoot = false;
+  try {
+    console.log('[Boot] Connecting Zalo before Telegram polling...');
+    const api = await getZaloApi();
+    setZaloApi(api);
+    await startZalo(api);
+    startHealthcheck();
+    zaloReadyAtBoot = true;
+    console.log('[Boot] Zalo ready before Telegram launch ✓');
+  } catch (err: unknown) {
+    console.warn('[Boot] Zalo auto-login failed (will still start Telegram for /login):', err);
+    startHealthcheck();
+  }
+
   tgBot.launch({ allowedUpdates: ['message', 'callback_query', 'message_reaction', 'poll_answer', 'poll'] }, () => {
     console.log('[Boot] Telegram bot started ✓');
 
@@ -187,24 +208,15 @@ async function main(): Promise<void> {
       .then(() => console.log('[Boot] Telegram command menu synced ✓'))
       .catch((err: unknown) => console.warn('[Boot] Failed to sync Telegram commands:', err));
 
-    getZaloApi()
-      .then(async (api) => {
-        setZaloApi(api);
-        await startZalo(api);
-        startHealthcheck();
-      })
-      .catch((err: unknown) => {
-        console.warn('[Boot] Zalo auto-login failed:', err);
-        tgBot.telegram
-          .sendMessage(
-            config.telegram.groupId,
-            '⚠️ Chưa đăng nhập Zalo. Gửi <b>/login</b> để đăng nhập.',
-            { parse_mode: 'HTML' },
-          )
-          .catch(() => undefined);
-        // Start healthcheck anyway so it can detect when login succeeds later
-        startHealthcheck();
-      });
+    if (!zaloReadyAtBoot) {
+      tgBot.telegram
+        .sendMessage(
+          config.telegram.groupId,
+          '⚠️ Chưa đăng nhập Zalo. Gửi <b>/login</b> để đăng nhập.',
+          { parse_mode: 'HTML' },
+        )
+        .catch(() => undefined);
+    }
   });
 
   console.log('[Boot] Bridge is running 🚀  (Ctrl+C to stop)');

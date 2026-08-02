@@ -1186,6 +1186,8 @@ function _flushZaloAlbum(
   const hasChildnum = buf.entries.some(e => e.childnumber > 0);
   const sorted = [...buf.entries].sort((a, b) =>
     hasChildnum ? a.childnumber - b.childnumber : _cmpMsgId(a.msgId, b.msgId));
+  // Diagnostic: log thứ tự sort thật để xác minh field nào đúng.
+  console.log(`[zaloAlbumStore] Flush key=${key} count=${sorted.length} hasChildnum=${hasChildnum} order=${sorted.map(e => e.msgId).join(',')}`);
   onFlush({ urls: sorted.map(e => e.url), zaloMsgIds: buf.zaloMsgIds, ...meta });
 }
 

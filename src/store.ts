@@ -1135,6 +1135,7 @@ export const mediaGroupStore = {
 
 interface ZaloAlbumEntry {
   url:         string;
+  msgId:       string;
   childnumber: number;
   addedAt:     number;
 }
@@ -1162,6 +1163,13 @@ const ALBUM_DEBOUNCE_MS = Number(process.env.ALBUM_DEBOUNCE_MS) > 0
 const ALBUM_MAX_WAIT_MS = Number(process.env.ALBUM_MAX_WAIT_MS) > 0
   ? Number(process.env.ALBUM_MAX_WAIT_MS) : 6000;
 
+// So sánh msgId dạng chuỗi số (Zalo msgId là chuỗi số nguyên tăng dần theo
+// thời gian gửi). Dùng BigInt để so sánh chính xác, fallback lexical.
+function _cmpMsgId(a: string, b: string): number {
+  try { return BigInt(a) < BigInt(b) ? -1 : BigInt(a) > BigInt(b) ? 1 : 0; }
+  catch { return a < b ? -1 : a > b ? 1 : 0; }
+}
+
 function _flushZaloAlbum(
   key: string,
   onFlush: (buf: Omit<ZaloAlbumBuffer, 'softTimer' | 'hardTimer' | 'entries'>) => void,
@@ -1172,11 +1180,12 @@ function _flushZaloAlbum(
   clearTimeout(buf.softTimer);
   clearTimeout(buf.hardTimer);
   _zaloAlbumBuffers.delete(key);
-  // Sắp xếp giữ đúng thứ tự người gửi: ưu tiên childnumber nếu Zalo cấp,
-  // ngược lại theo thời gian nhận event (addedAt).
+  // Sắp xếp giữ đúng thứ tự người gửi: ưu tiên childnumber nếu Zalo cấp
+  // (đáng tin nhất), ngược lại theo msgId (chuỗi số tăng dần = thứ tự gửi thật).
+  // KHÔNG sort theo addedAt vì event Zalo đến bridge có thể LỘN XỘN.
   const hasChildnum = buf.entries.some(e => e.childnumber > 0);
   const sorted = [...buf.entries].sort((a, b) =>
-    hasChildnum ? a.childnumber - b.childnumber : a.addedAt - b.addedAt);
+    hasChildnum ? a.childnumber - b.childnumber : _cmpMsgId(a.msgId, b.msgId));
   onFlush({ urls: sorted.map(e => e.url), zaloMsgIds: buf.zaloMsgIds, ...meta });
 }
 
@@ -1184,6 +1193,7 @@ export const zaloAlbumStore = {
   add(
     key: string,
     url: string,
+    msgId: string,
     msgIds: string[],
     meta: Omit<ZaloAlbumBuffer, 'softTimer' | 'hardTimer' | 'entries' | 'urls' | 'zaloMsgIds'>,
     onFlush: (buf: Omit<ZaloAlbumBuffer, 'softTimer' | 'hardTimer' | 'entries'>) => void,
@@ -1196,7 +1206,7 @@ export const zaloAlbumStore = {
       clearTimeout(existing.softTimer);
       // Dedup URL — Zalo group chat có thể re-emit cùng ảnh với msgId khác.
       if (!existing.entries.some(e => e.url === url)) {
-        existing.entries.push({ url, childnumber, addedAt: now });
+        existing.entries.push({ url, msgId, childnumber, addedAt: now });
       } else {
         console.log(`[zaloAlbumStore] Skipping duplicate URL in album buffer (key=${key}, entries=${existing.entries.length})`);
       }
@@ -1207,7 +1217,7 @@ export const zaloAlbumStore = {
     } else {
       const buf: ZaloAlbumBuffer = {
         ...meta,
-        entries: [{ url, childnumber, addedAt: now }],
+        entries: [{ url, msgId, childnumber, addedAt: now }],
         urls: [],
         zaloMsgIds: [...msgIds],
         softTimer: setTimeout(() => _flushZaloAlbum(key, onFlush, meta), ALBUM_DEBOUNCE_MS),

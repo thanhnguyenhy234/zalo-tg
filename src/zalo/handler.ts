@@ -961,6 +961,7 @@ export async function setupZaloHandler(api: ZaloAPI): Promise<void> {
         zaloAlbumStore.add(
           albumKey,
           url,
+          msg.data.msgId,
           zaloMsgIds,
           { senderName: bridgeSenderName, topicId, tgBase, zaloQuote: zaloQuoteData },
           async (buf) => {

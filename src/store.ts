@@ -1128,10 +1128,22 @@ export const mediaGroupStore = {
 };
 
 // ── Zalo album buffer (Zalo→TG multi-photo) ────────────────────────────────────
+// Adaptive debounce buffer: mỗi ảnh đến reset soft timer → gom được cả album
+// kể cả khi Zalo gửi ảnh rải rác hoặc không cấp childnumber (thực tế nhóm chat
+// Zalo hay emit toàn bộ ảnh với childnumber=0). Hard timer đảm bảo flush chắc
+// chắn sau một thời gian tối đa kể từ ảnh đầu tiên.
+
+interface ZaloAlbumEntry {
+  url:         string;
+  childnumber: number;
+  addedAt:     number;
+}
 
 interface ZaloAlbumBuffer {
-  timer:      ReturnType<typeof setTimeout>;
-  urls:       string[];
+  softTimer:  ReturnType<typeof setTimeout>;
+  hardTimer:  ReturnType<typeof setTimeout>;
+  entries:    ZaloAlbumEntry[];
+  urls:       string[];              // snapshot đã sort, gán khi flush
   senderName: string;
   topicId:    number;
   tgBase:     { message_thread_id: number; reply_parameters?: { message_id: number; allow_sending_without_reply: boolean } };
@@ -1141,65 +1153,65 @@ interface ZaloAlbumBuffer {
 
 const _zaloAlbumBuffers = new Map<string, ZaloAlbumBuffer>(); // key = `${threadId}:${uidFrom}`
 
+// Cửa sổ gom album (ms). Mỗi ảnh mới reset soft timer về giá trị này, nên một
+// album 10 ảnh đến rải rác trong vài giây vẫn được gom thành 1 lần flush.
+// Override qua env ALBUM_DEBOUNCE_MS nếu cần tune.
+const ALBUM_DEBOUNCE_MS = Number(process.env.ALBUM_DEBOUNCE_MS) > 0
+  ? Number(process.env.ALBUM_DEBOUNCE_MS) : 600;
+// Timeout cứng (ms) kể từ ảnh đầu tiên — flush chắc chắn để không treo vô hạn.
+const ALBUM_MAX_WAIT_MS = Number(process.env.ALBUM_MAX_WAIT_MS) > 0
+  ? Number(process.env.ALBUM_MAX_WAIT_MS) : 6000;
+
+function _flushZaloAlbum(
+  key: string,
+  onFlush: (buf: Omit<ZaloAlbumBuffer, 'softTimer' | 'hardTimer' | 'entries'>) => void,
+  meta: Omit<ZaloAlbumBuffer, 'softTimer' | 'hardTimer' | 'entries' | 'urls' | 'zaloMsgIds'>,
+): void {
+  const buf = _zaloAlbumBuffers.get(key);
+  if (!buf) return;
+  clearTimeout(buf.softTimer);
+  clearTimeout(buf.hardTimer);
+  _zaloAlbumBuffers.delete(key);
+  // Sắp xếp giữ đúng thứ tự người gửi: ưu tiên childnumber nếu Zalo cấp,
+  // ngược lại theo thời gian nhận event (addedAt).
+  const hasChildnum = buf.entries.some(e => e.childnumber > 0);
+  const sorted = [...buf.entries].sort((a, b) =>
+    hasChildnum ? a.childnumber - b.childnumber : a.addedAt - b.addedAt);
+  onFlush({ urls: sorted.map(e => e.url), zaloMsgIds: buf.zaloMsgIds, ...meta });
+}
+
 export const zaloAlbumStore = {
   add(
     key: string,
     url: string,
     msgIds: string[],
-    meta: Omit<ZaloAlbumBuffer, 'timer' | 'urls' | 'zaloMsgIds'>,
-    onFlush: (buf: Omit<ZaloAlbumBuffer, 'timer'>) => void,
+    meta: Omit<ZaloAlbumBuffer, 'softTimer' | 'hardTimer' | 'entries' | 'urls' | 'zaloMsgIds'>,
+    onFlush: (buf: Omit<ZaloAlbumBuffer, 'softTimer' | 'hardTimer' | 'entries'>) => void,
     childnumber = 0,
   ): void {
-    // If a new album (childnumber==0) arrives while a buffer exists for
-    // the same key, flush the old buffer immediately to prevent album merging.
-    // HOWEVER, if the existing buffer already contains this exact URL, it's a
-    // Zalo re-emit (duplicate event with a different msgId) — DON'T flush,
-    // just merge msgIds into the existing buffer instead.
-    if (childnumber === 0) {
-      const existing = _zaloAlbumBuffers.get(key);
-      if (existing) {
-        if (existing.urls.includes(url)) {
-          // Duplicate re-emit — absorb into existing buffer, don't flush
-          clearTimeout(existing.timer);
-          existing.zaloMsgIds.push(...msgIds);
-          existing.timer = setTimeout(() => {
-            _zaloAlbumBuffers.delete(key);
-            onFlush({ urls: existing.urls, zaloMsgIds: existing.zaloMsgIds, ...meta });
-          }, 200);
-          console.log(`[zaloAlbumStore] Absorbed duplicate childnumber=0 event (key=${key}, url already in buffer)`);
-          return;
-        }
-        // Genuinely new album — flush old buffer first
-        clearTimeout(existing.timer);
-        _zaloAlbumBuffers.delete(key);
-        setImmediate(() => onFlush({ urls: existing.urls, zaloMsgIds: existing.zaloMsgIds, ...meta }));
-      }
-    }
+    const now = Date.now();
     const existing = _zaloAlbumBuffers.get(key);
+
     if (existing) {
-      clearTimeout(existing.timer);
-      // Deduplicate URLs — Zalo group chats can re-emit the same photo event
-      // with a different msgId, causing identical images to be buffered.
-      // Only add the URL if it's not already in the buffer.
-      if (!existing.urls.includes(url)) {
-        existing.urls.push(url);
+      clearTimeout(existing.softTimer);
+      // Dedup URL — Zalo group chat có thể re-emit cùng ảnh với msgId khác.
+      if (!existing.entries.some(e => e.url === url)) {
+        existing.entries.push({ url, childnumber, addedAt: now });
       } else {
-        console.log(`[zaloAlbumStore] Skipping duplicate URL in album buffer (key=${key}, urls=${existing.urls.length})`);
+        console.log(`[zaloAlbumStore] Skipping duplicate URL in album buffer (key=${key}, entries=${existing.entries.length})`);
       }
       existing.zaloMsgIds.push(...msgIds);
-      existing.timer = setTimeout(() => {
-        _zaloAlbumBuffers.delete(key);
-        onFlush({ urls: existing.urls, zaloMsgIds: existing.zaloMsgIds, ...meta });
-      }, 200);
+      // Reset soft timer (adaptive debounce) — gom thêm ảnh nếu album chưa kết thúc.
+      existing.softTimer = setTimeout(() => _flushZaloAlbum(key, onFlush, meta), ALBUM_DEBOUNCE_MS);
+      // Hard timer KHÔNG reset — đảm bảo flush sau ALBUM_MAX_WAIT_MS kể từ ảnh đầu.
     } else {
       const buf: ZaloAlbumBuffer = {
         ...meta,
-        urls: [url],
+        entries: [{ url, childnumber, addedAt: now }],
+        urls: [],
         zaloMsgIds: [...msgIds],
-        timer: setTimeout(() => {
-          _zaloAlbumBuffers.delete(key);
-          onFlush({ urls: buf.urls, zaloMsgIds: buf.zaloMsgIds, ...meta });
-        }, 200),
+        softTimer: setTimeout(() => _flushZaloAlbum(key, onFlush, meta), ALBUM_DEBOUNCE_MS),
+        hardTimer: setTimeout(() => _flushZaloAlbum(key, onFlush, meta), ALBUM_MAX_WAIT_MS),
       };
       _zaloAlbumBuffers.set(key, buf);
     }

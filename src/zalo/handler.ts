@@ -987,17 +987,35 @@ ${escapeHtml(photoCaption)}`
                 msgStore.save(sent.message_id, buf.zaloMsgIds, buf.zaloQuote!);
               } finally { await cleanTemp(localPath); }
             } else {
-              // Multi-photo album — download all concurrently and send as media group
+              // Multi-photo album — download từng ảnh theo đúng thứ tự với retry,
+              // rồi gửi cả nhóm bằng sendMediaGroup (giữ thứ tự gốc).
               const localPaths: string[] = [];
               try {
-                const dlResults = await Promise.allSettled(buf.urls.map(u => downloadToTemp(u, `photo_${Date.now()}.jpg`)));
-                const dlPaths = dlResults.flatMap(r => {
-                  if (r.status === 'fulfilled') return [r.value];
-                  console.warn('[ZaloHandler] Album: skipping failed photo download:', r.reason);
-                  return [];
-                });
-                if (dlPaths.length === 0) return;
-                localPaths.push(...dlPaths);
+                const dlPaths: (string | undefined)[] = await Promise.all(
+                  buf.urls.map(async (u, idx) => {
+                    for (let attempt = 1; attempt <= 3; attempt++) {
+                      try {
+                        return await downloadToTemp(u, `photo_${Date.now()}_${idx}.jpg`);
+                      } catch (e) {
+                        if (attempt === 3) {
+                          console.warn(`[ZaloHandler] Album: photo #${idx} download failed after 3 retries:`, e);
+                          return undefined;
+                        }
+                        await new Promise(r => setTimeout(r, 400 * attempt));
+                      }
+                    }
+                    return undefined;
+                  }),
+                );
+                const okPaths = dlPaths.filter((p): p is string => !!p);
+                if (okPaths.length === 0) {
+                  console.warn(`[ZaloHandler] Album: tất cả ${buf.urls.length} ảnh download thất bại, bỏ qua`);
+                  return;
+                }
+                if (okPaths.length < buf.urls.length) {
+                  console.warn(`[ZaloHandler] Album: gửi ${okPaths.length}/${buf.urls.length} ảnh (một số download thất bại)`);
+                }
+                localPaths.push(...okPaths);
                 const captionText = photoCaption
                   ? `${groupCaption(buf.senderName)}
 ${escapeHtml(photoCaption)}`

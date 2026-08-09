@@ -514,19 +514,23 @@ async function _doCreateTopic(
     try {
       const localPath = await downloadToTemp(avatarUrl, `avatar_${Date.now()}.jpg`);
       const stream = createReadStream(localPath);
-      const avatarMsg = await tg.sendPhoto(
-        config.telegram.groupId,
-        { source: stream },
-        {
-          message_thread_id: topicId,
-          caption: `🖼 Ảnh đại diện nhóm <b>${escapeHtml(displayName)}</b>`,
-          parse_mode: 'HTML',
-        },
-      );
-      await cleanTemp(localPath);
       try {
-        await tg.pinChatMessage(config.telegram.groupId, avatarMsg.message_id, { disable_notification: true });
-      } catch { /* pinning requires admin rights */ }
+        const avatarMsg = await tg.sendPhoto(
+          config.telegram.groupId,
+          { source: stream },
+          {
+            message_thread_id: topicId,
+            caption: `🖼 Ảnh đại diện nhóm <b>${escapeHtml(displayName)}</b>`,
+            parse_mode: 'HTML',
+          },
+        );
+        try {
+          await tg.pinChatMessage(config.telegram.groupId, avatarMsg.message_id, { disable_notification: true });
+        } catch { /* pinning requires admin rights */ }
+      } finally {
+        stream.destroy();
+        await cleanTemp(localPath);
+      }
     } catch (avatarErr) {
       console.warn(`[Zalo→TG] Failed to pin group avatar for ${displayName}:`, avatarErr);
     }
@@ -986,7 +990,7 @@ ${escapeHtml(photoCaption)}`
                 // Use buf.zaloQuote which already has the correct cliMsgId and
                 // parsed media content object (not raw JSON string).
                 msgStore.save(sent.message_id, buf.zaloMsgIds, buf.zaloQuote!);
-              } finally { await cleanTemp(localPath); }
+              } finally { stream.destroy(); await cleanTemp(localPath); }
             } else {
               // Multi-photo album — download từng ảnh theo đúng thứ tự với retry,
               // rồi gửi cả nhóm bằng sendMediaGroup (giữ thứ tự gốc).
@@ -1025,21 +1029,26 @@ ${escapeHtml(photoCaption)}`
                 const BATCH = 10;
                 for (let i = 0; i < localPaths.length; i += BATCH) {
                   const batch = localPaths.slice(i, i + BATCH);
+                  const batchStreams = batch.map((lp) => createReadStream(lp));
                   // eslint-disable-next-line @typescript-eslint/no-explicit-any
                   const mediaItems: any[] = batch.map((lp, j) => ({
                     type: 'photo',
-                    media: { source: createReadStream(lp) },
+                    media: { source: batchStreams[j] },
                     ...(i === 0 && j === 0 && captionText ? { caption: captionText, parse_mode: 'HTML' } : {}),
                   }));
-                  const sentMsgs = await tg.sendMediaGroup(
-                    config.telegram.groupId,
-                    mediaItems,
-                    { message_thread_id: buf.topicId } as Parameters<typeof tg.sendMediaGroup>[2],
-                  );
-                  // Save mapping for every photo so replying to ANY album photo
-                  // produces a valid Zalo quote
-                  for (const sentMsg of sentMsgs) {
-                    msgStore.save(sentMsg.message_id, buf.zaloMsgIds, buf.zaloQuote!);
+                  try {
+                    const sentMsgs = await tg.sendMediaGroup(
+                      config.telegram.groupId,
+                      mediaItems,
+                      { message_thread_id: buf.topicId } as Parameters<typeof tg.sendMediaGroup>[2],
+                    );
+                    // Save mapping for every photo so replying to ANY album photo
+                    // produces a valid Zalo quote
+                    for (const sentMsg of sentMsgs) {
+                      msgStore.save(sentMsg.message_id, buf.zaloMsgIds, buf.zaloQuote!);
+                    }
+                  } finally {
+                    for (const s of batchStreams) s.destroy();
                   }
                 }
               } finally {
@@ -1062,7 +1071,7 @@ ${escapeHtml(photoCaption)}`
         try {
           const sent = await tg.sendPhoto(config.telegram.groupId, { source: stream }, tgOpts);
           saveTgMapping(sent);
-        } finally { await cleanTemp(localPath); }
+        } finally { stream.destroy(); await cleanTemp(localPath); }
         return;
       }
 
@@ -1083,7 +1092,7 @@ ${escapeHtml(photoCaption)}`
             tgOpts,
           );
           saveTgMapping(sent);
-        } finally { await cleanTemp(localPath); }
+        } finally { stream.destroy(); await cleanTemp(localPath); }
         return;
       }
 
@@ -1120,7 +1129,7 @@ ${escapeHtml(photoCaption)}`
             tgOpts,
           );
           saveTgMapping(sent);
-        } finally { await cleanTemp(localPath); }
+        } finally { stream.destroy(); await cleanTemp(localPath); }
         return;
       }
 
@@ -1133,7 +1142,7 @@ ${escapeHtml(photoCaption)}`
         try {
           const sent = await tg.sendVideo(config.telegram.groupId, { source: stream }, tgOpts);
           saveTgMapping(sent);
-        } finally { await cleanTemp(localPath); }
+        } finally { stream.destroy(); await cleanTemp(localPath); }
         return;
       }
 
@@ -1147,7 +1156,7 @@ ${escapeHtml(photoCaption)}`
         try {
           const sent = await tg.sendVoice(config.telegram.groupId, { source: stream }, tgOpts);
           saveTgMapping(sent);
-        } finally { await cleanTemp(localPath); }
+        } finally { stream.destroy(); await cleanTemp(localPath); }
         return;
       }
 
@@ -1178,24 +1187,30 @@ ${escapeHtml(photoCaption)}`
               // Animated stickers are sprite sheets — send as photo with label
               const animCaption = `${groupCaption(bridgeSenderName)} <i>(sticker động 🎥)</i>`;
               const stream = createReadStream(localPath);
-              sent = await tg.sendPhoto(config.telegram.groupId, { source: stream }, {
-                ...tgBase,
-                caption: animCaption,
-                parse_mode: 'HTML',
-              });
+              try {
+                sent = await tg.sendPhoto(config.telegram.groupId, { source: stream }, {
+                  ...tgBase,
+                  caption: animCaption,
+                  parse_mode: 'HTML',
+                });
+              } finally { stream.destroy(); }
             } else {
               try {
                 // Try native TG sticker (webp ≤512 KB displays as a proper sticker)
                 const stream = createReadStream(localPath);
-                sent = await tg.sendSticker(
-                  config.telegram.groupId,
-                  { source: stream },
-                  tgBase as Parameters<typeof tg.sendSticker>[2],
-                );
+                try {
+                  sent = await tg.sendSticker(
+                    config.telegram.groupId,
+                    { source: stream },
+                    tgBase as Parameters<typeof tg.sendSticker>[2],
+                  );
+                } finally { stream.destroy(); }
               } catch {
                 // Fall back to photo if file is too large or format unsupported
                 const stream = createReadStream(localPath);
-                sent = await tg.sendPhoto(config.telegram.groupId, { source: stream }, tgOpts);
+                try {
+                  sent = await tg.sendPhoto(config.telegram.groupId, { source: stream }, tgOpts);
+                } finally { stream.destroy(); }
               }
             }
             saveTgMapping(sent);
@@ -1520,13 +1535,17 @@ ${escapeHtml(photoCaption)}`
             try {
               const localPath = await downloadToTemp(qrUrl, `qr_${Date.now()}.jpg`);
               const stream = createReadStream(localPath);
-              const sent = await tg.sendPhoto(
-                config.telegram.groupId,
-                { source: stream },
-                { ...tgBase, caption: fullText, parse_mode: 'HTML' },
-              );
-              saveTgMapping(sent);
-              await cleanTemp(localPath);
+              try {
+                const sent = await tg.sendPhoto(
+                  config.telegram.groupId,
+                  { source: stream },
+                  { ...tgBase, caption: fullText, parse_mode: 'HTML' },
+                );
+                saveTgMapping(sent);
+              } finally {
+                stream.destroy();
+                await cleanTemp(localPath);
+              }
             } catch {
               const sent = await tg.sendMessage(config.telegram.groupId, fullText, { ...tgBase, parse_mode: 'HTML' });
               saveTgMapping(sent);
@@ -1560,13 +1579,18 @@ ${escapeHtml(photoCaption)}`
         if (imgUrl) {
           try {
             const localPath = await downloadToTemp(imgUrl, `ecard_${Date.now()}.png`);
-            const sent = await tg.sendPhoto(
-              config.telegram.groupId,
-              { source: createReadStream(localPath) },
-              { ...tgBase, caption: ecardCaption, parse_mode: 'HTML' },
-            );
-            saveTgMapping(sent);
-            await cleanTemp(localPath);
+            const stream = createReadStream(localPath);
+            try {
+              const sent = await tg.sendPhoto(
+                config.telegram.groupId,
+                { source: stream },
+                { ...tgBase, caption: ecardCaption, parse_mode: 'HTML' },
+              );
+              saveTgMapping(sent);
+            } finally {
+              stream.destroy();
+              await cleanTemp(localPath);
+            }
           } catch {
             const sent = await tg.sendMessage(config.telegram.groupId, ecardCaption, { ...tgBase, parse_mode: 'HTML' });
             saveTgMapping(sent);

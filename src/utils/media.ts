@@ -64,12 +64,20 @@ export async function downloadToTemp(url: string, fileName?: string, retries = 3
         headers: { 'User-Agent': 'Mozilla/5.0 (compatible; ZaloTGBridge/1.0)' },
       });
 
-      await new Promise<void>((resolve, reject) => {
-        const writer = createWriteStream(filePath);
-        resp.data.pipe(writer);
-        writer.on('finish', resolve);
-        writer.on('error', reject);
-      });
+      const writer = createWriteStream(filePath);
+      try {
+        await new Promise<void>((resolve, reject) => {
+          resp.data.pipe(writer);
+          resp.data.on('error', reject);
+          writer.on('finish', resolve);
+          writer.on('error', reject);
+        });
+      } catch (err) {
+        // Destroy both streams so their FDs are released before the unlink below
+        (resp.data as { destroy?: () => void }).destroy?.();
+        writer.destroy();
+        throw err;
+      }
 
       const { size } = await stat(filePath);
       if (size === 0) {

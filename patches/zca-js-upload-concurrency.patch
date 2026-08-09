@@ -1,0 +1,26 @@
+--- a/node_modules/zca-js/dist/apis/uploadAttachment.js
++++ b/node_modules/zca-js/dist/apis/uploadAttachment.js
+@@ -147,7 +147,7 @@
+                 const encryptedParams = utils.encodeAES(JSON.stringify(data.params));
+                 if (!encryptedParams)
+                     throw new ZaloApiError("Failed to encrypt message");
+-                requests.push(utils
++                requests.push(() => utils
+                     .request(utils.makeURL(url + urlType[data.fileType], { type: typeParam, params: encryptedParams }), {
+                     method: "POST",
+                     headers: data.chunkContent[i].getHeaders(),
+@@ -191,7 +191,13 @@
+                 data.params.chunkId++;
+             }
+         }
+-        await Promise.all(requests);
++        // Limit upload concurrency: chunk requests are lazy thunks, run them in
++        // sequential batches instead of firing all at once — launching ~55 parallel
++        // connections from the Pi triggers ConnectTimeoutError on large files.
++        const UPLOAD_BATCH_SIZE = 5;
++        for (let i = 0; i < requests.length; i += UPLOAD_BATCH_SIZE) {
++            await Promise.all(requests.slice(i, i + UPLOAD_BATCH_SIZE).map((startRequest) => startRequest()));
++        }
+         return results;
+     };
+ });

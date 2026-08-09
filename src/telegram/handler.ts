@@ -731,15 +731,20 @@ async function handleLoginCommand(
 
     const newApi = await triggerQRLogin({
       onQRReady: async (imagePath) => {
-        await tgBot.telegram.sendPhoto(
-          chatId,
-          { source: createReadStream(imagePath) },
-          {
-            ...msgOpts,
-            caption: '📱 Mở ứng dụng <b>Zalo</b> → Cài đặt → Quét mã QR để đăng nhập.',
-            parse_mode: 'HTML',
-          },
-        );
+        const stream = createReadStream(imagePath);
+        try {
+          await tgBot.telegram.sendPhoto(
+            chatId,
+            { source: stream },
+            {
+              ...msgOpts,
+              caption: '📱 Mở ứng dụng <b>Zalo</b> → Cài đặt → Quét mã QR để đăng nhập.',
+              parse_mode: 'HTML',
+            },
+          );
+        } finally {
+          stream.destroy();
+        }
       },
       onExpired: async () => {
         await tgBot.telegram.sendMessage(chatId, '⏰ QR hết hạn, đang tạo mã mới...', msgOpts);

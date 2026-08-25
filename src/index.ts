@@ -201,32 +201,54 @@ async function main(): Promise<void> {
     startHealthcheck();
   }
 
-  tgBot.launch({ allowedUpdates: ['message', 'callback_query', 'message_reaction', 'poll_answer', 'poll'] }, () => {
-    console.log('[Boot] Telegram bot started ✓');
+  let isShuttingDown = false;
 
-    syncTelegramCommands()
-      .then(() => console.log('[Boot] Telegram command menu synced ✓'))
-      .catch((err: unknown) => console.warn('[Boot] Failed to sync Telegram commands:', err));
+  const launchTelegram = async () => {
+    while (!isShuttingDown) {
+      try {
+        await tgBot.launch({ allowedUpdates: ['message', 'callback_query', 'message_reaction', 'poll_answer', 'poll'] }, () => {
+          console.log('[Boot] Telegram bot started ✓');
 
-    if (!zaloReadyAtBoot) {
-      tgBot.telegram
-        .sendMessage(
-          config.telegram.groupId,
-          '⚠️ Chưa đăng nhập Zalo. Gửi <b>/login</b> để đăng nhập.',
-          { parse_mode: 'HTML' },
-        )
-        .catch(() => undefined);
+          syncTelegramCommands()
+            .then(() => console.log('[Boot] Telegram command menu synced ✓'))
+            .catch((err: unknown) => console.warn('[Boot] Failed to sync Telegram commands:', err));
+
+          if (!zaloReadyAtBoot) {
+            tgBot.telegram
+              .sendMessage(
+                config.telegram.groupId,
+                '⚠️ Chưa đăng nhập Zalo. Gửi <b>/login</b> để đăng nhập.',
+                { parse_mode: 'HTML' },
+              )
+              .catch(() => undefined);
+          }
+        });
+        if (isShuttingDown) break;
+        console.warn('[Boot] Telegram polling ended, relaunching in 3s...');
+      } catch (err) {
+        if (isShuttingDown) break;
+        console.error('[Boot] Telegram polling crashed, relaunching in 3s...', err);
+      }
+      try {
+        tgBot.stop('relaunch');
+      } catch {
+        // ignore if already stopped
+      }
+      await new Promise((r) => setTimeout(r, 3000));
     }
-  });
+  };
+
+  void launchTelegram();
 
   console.log('[Boot] Bridge is running 🚀  (Ctrl+C to stop)');
 
   // ── Graceful shutdown ──────────────────────────────────────────────────────
   const shutdown = async (signal: string) => {
+    isShuttingDown = true;
     console.log(`\n[Boot] Received ${signal}, shutting down...`);
     stopHealthcheck();
     try { const api = await getZaloApi(); api.listener.stop(); } catch { /* ignore */ }
-    await tgBot.stop(signal);
+    try { await tgBot.stop(signal); } catch { /* ignore */ }
     await new Promise(r => setTimeout(r, 2500));
     process.exit(0);
   };

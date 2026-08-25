@@ -41,6 +41,11 @@ export const tgBot = new Telegraf(config.telegram.token, {
     : { agent },
 });
 
+tgBot.catch((err, ctx) => {
+  const updateId = ctx?.update?.update_id;
+  console.error(`[Telegram] Handler error (update ${updateId ?? '?'}):`, err);
+});
+
 export async function syncTelegramCommands(): Promise<void> {
   await tgBot.telegram.setMyCommands(BOT_COMMANDS);
   await tgBot.telegram.setMyCommands(BOT_COMMANDS, {

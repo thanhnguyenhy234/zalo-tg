@@ -442,12 +442,20 @@ async function getOrCreateTopic(
 }
 
 /**
+ * Check if a TG API error means the topic/thread is closed (can be reopened).
+ */
+function isTopicClosedError(err: unknown): boolean {
+  const msg = (err instanceof Error ? err.message : String(err)).toLowerCase();
+  return msg.includes('topic_closed') || msg.includes('message thread is closed');
+}
+
+/**
  * Check if a TG API error means the topic/thread was deleted.
  * If so, remove the stale mapping and re-throw so the caller can recreate.
  */
 function isTopicDeletedError(err: unknown): boolean {
-  const msg = err instanceof Error ? err.message : String(err);
-  return msg.includes('message thread not found') || msg.includes('TOPIC_CLOSED') || msg.includes('thread not found');
+  const msg = (err instanceof Error ? err.message : String(err)).toLowerCase();
+  return msg.includes('message thread not found') || msg.includes('thread not found');
 }
 
 /**
@@ -466,7 +474,8 @@ async function sendWithTopicRecovery<T>(
     return await sendFn(currentTopicId);
   } catch (err) {
     if (!isTopicDeletedError(err)) throw err;
-    console.warn(`[Zalo→TG] Topic ${currentTopicId} deleted — removing mapping and recreating for ${zaloId}`);
+    const errMsg = err instanceof Error ? err.message : String(err);
+    console.warn(`[TopicRecovery] Removing mapping topic=${currentTopicId} zalo=${zaloId} reason=${errMsg}`);
     store.remove(currentTopicId);
     const newTopicId = await getOrCreateTopic(zaloId, type, displayName, avatarUrl, true);
     return sendFn(newTopicId);
@@ -670,9 +679,8 @@ export async function setupZaloHandler(api: ZaloAPI): Promise<void> {
     console.warn('[Zalo] Failed to load address-book names:', err);
   }
 
-  api.listener.on('message', async (msg: ZaloMessage) => {
-    try {
-      // Skip messages sent by the bot (TG→Zalo echo) but NOT messages
+  async function processZaloMessage(msg: ZaloMessage, isRetry = false): Promise<void> {
+    // Skip messages sent by the bot (TG→Zalo echo) but NOT messages
       // the user sends directly from the Zalo app.
       // We check both sentMsgStore (post-save) and isSendingTo (race window).
       if (msg.isSelf) {
@@ -716,7 +724,7 @@ export async function setupZaloHandler(api: ZaloAPI): Promise<void> {
       // (handles concurrent re-emits that arrive before any is saved to msgStore).
       const _primaryMsgId = msg.data.msgId;
       if (_primaryMsgId) {
-        if (msgStore.getTgMsgId(_primaryMsgId) !== undefined || _inFlightMsgIds.has(_primaryMsgId)) {
+        if (!isRetry && (msgStore.getTgMsgId(_primaryMsgId) !== undefined || _inFlightMsgIds.has(_primaryMsgId))) {
           console.log(`[Zalo→TG] Skip duplicate/reaction re-emit msgId=${_primaryMsgId}`);
           return;
         }
@@ -1697,13 +1705,34 @@ ${escapeHtml(photoCaption)}`
         parse_mode: 'HTML',
       });
       saveTgMapping(sentFallback);
+  }
+
+  api.listener.on('message', async (msg: ZaloMessage) => {
+    try {
+      await processZaloMessage(msg);
     } catch (err) {
-      // If the TG topic was deleted, clear the stale mapping so the next message
-      // from this conversation will trigger topic recreation automatically.
-      if (isTopicDeletedError(err)) {
+      if (isTopicClosedError(err)) {
         const staleTopicId = store.getTopicByZalo(msg.threadId, msg.type as 0 | 1);
         if (staleTopicId !== undefined) {
-          console.warn(`[Zalo→TG] Topic ${staleTopicId} was deleted — removing stale mapping for ${msg.threadId}`);
+          try {
+            await tg.reopenForumTopic(config.telegram.groupId, staleTopicId);
+            console.log(`[Zalo→TG] Topic ${staleTopicId} was closed — reopened successfully for ${msg.threadId}, retrying message`);
+            try {
+              await processZaloMessage(msg, true);
+            } catch (retryErr) {
+              console.error(`[Zalo→TG] Retry message after reopening topic ${staleTopicId} failed:`, retryErr);
+            }
+          } catch (reopenErr) {
+            console.error(`[Zalo→TG] Topic ${staleTopicId} was closed for ${msg.threadId} — reopen failed, keeping mapping:`, reopenErr);
+          }
+        } else {
+          console.error(`[Zalo→TG] Topic closed error for ${msg.threadId} but topicId not found in store:`, err);
+        }
+      } else if (isTopicDeletedError(err)) {
+        const staleTopicId = store.getTopicByZalo(msg.threadId, msg.type as 0 | 1);
+        if (staleTopicId !== undefined) {
+          const reason = err instanceof Error ? err.message : String(err);
+          console.warn(`[TopicRecovery] Removing mapping topic=${staleTopicId} zalo=${msg.threadId} reason=${reason}`);
           store.remove(staleTopicId);
         }
       } else {

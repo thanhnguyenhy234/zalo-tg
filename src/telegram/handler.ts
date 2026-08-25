@@ -2592,13 +2592,23 @@ Toàn bộ icon hỗ trợ (${stickers.length}):
         topicAlive = true;
       } catch (checkErr) {
         const checkMsg = checkErr instanceof Error ? checkErr.message : String(checkErr);
+        const lowerCheckMsg = checkMsg.toLowerCase();
         if (
-          checkMsg.includes('thread not found') ||
-          checkMsg.includes('message thread not found') ||
-          checkMsg.includes('TOPIC_CLOSED') ||
-          checkMsg.includes('the message thread is closed')
+          lowerCheckMsg.includes('topic_closed') ||
+          lowerCheckMsg.includes('message thread is closed')
         ) {
-          console.warn(`[sc/sg] Topic ${existing} is gone — removing stale mapping for ${entityId}`);
+          try {
+            await ctx.telegram.reopenForumTopic(config.telegram.groupId, existing);
+            console.log(`[sc/sg] Topic ${existing} was closed for ${entityId} — reopened successfully`);
+          } catch (reopenErr) {
+            console.error(`[sc/sg] Topic ${existing} was closed for ${entityId} — reopen failed, keeping mapping:`, reopenErr);
+          }
+          topicAlive = true;
+        } else if (
+          lowerCheckMsg.includes('message thread not found') ||
+          lowerCheckMsg.includes('thread not found')
+        ) {
+          console.warn(`[TopicRecovery] Removing mapping topic=${existing} zalo=${entityId} reason=${checkMsg}`);
           store.remove(existing);
         } else {
           // Unknown error (e.g. rate limit) — assume alive, don't recreate
@@ -2973,6 +2983,18 @@ Toàn bộ icon hỗ trợ (${stickers.length}):
         );
       };
 
+      async function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        const timeout = new Promise<never>((_, reject) => {
+          timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
+        });
+        try {
+          return await Promise.race([promise, timeout]);
+        } finally {
+          if (timer) clearTimeout(timer);
+        }
+      }
+
       const sendAttachment = async (
         fileId: string,
         filename: string,
@@ -3039,32 +3061,36 @@ Toàn bộ icon hỗ trợ (${stickers.length}):
             }];
           }
 
-          const sendResult = await api.sendMessage(
-            {
-              msg: effectiveCaption,
-              attachments: attachmentSource,
-              ...(effectiveCaption.length && zaloQuote ? { quote: zaloQuote } : {}),
-              ...(captionMentions?.length ? { mentions: captionMentions } : {}),
-            },
-            zaloId,
-            threadType,
-          ).catch(async (err: unknown) => {
-            // Code 114 with quote: quote data incompatible with this message type.
-            // Retry without quote so the attachment still goes through.
-            if ((err as { code?: number })?.code === 114) {
-              console.warn('[TG→Zalo] code 114 on attachment+quote, retrying without quote');
-              return api.sendMessage(
-                {
-                  msg: effectiveCaption,
-                  attachments: attachmentSource,
-                  ...(captionMentions?.length ? { mentions: captionMentions } : {}),
-                },
-                zaloId,
-                threadType,
-              );
-            }
-            throw err;
-          }) as { message?: { msgId?: number } | null; attachment?: Array<{ msgId?: number }> };
+          const sendResult = await withTimeout(
+            api.sendMessage(
+              {
+                msg: effectiveCaption,
+                attachments: attachmentSource,
+                ...(effectiveCaption.length && zaloQuote ? { quote: zaloQuote } : {}),
+                ...(captionMentions?.length ? { mentions: captionMentions } : {}),
+              },
+              zaloId,
+              threadType,
+            ).catch(async (err: unknown) => {
+              // Code 114 with quote: quote data incompatible with this message type.
+              // Retry without quote so the attachment still goes through.
+              if ((err as { code?: number })?.code === 114) {
+                console.warn('[TG→Zalo] code 114 on attachment+quote, retrying without quote');
+                return api.sendMessage(
+                  {
+                    msg: effectiveCaption,
+                    attachments: attachmentSource,
+                    ...(captionMentions?.length ? { mentions: captionMentions } : {}),
+                  },
+                  zaloId,
+                  threadType,
+                );
+              }
+              throw err;
+            }),
+            120_000,
+            'Zalo attachment upload',
+          ) as { message?: { msgId?: number } | null; attachment?: Array<{ msgId?: number }> };
 
           const zaloMsgId = sendResult?.message?.msgId ?? sendResult?.attachment?.[0]?.msgId;
           if (zaloMsgId !== undefined) {

@@ -1146,6 +1146,7 @@ interface ZaloAlbumBuffer {
   entries:    ZaloAlbumEntry[];
   urls:       string[];              // snapshot đã sort, gán khi flush
   senderName: string;
+  senderUid?: string;
   topicId:    number;
   tgBase:     { message_thread_id: number; reply_parameters?: { message_id: number; allow_sending_without_reply: boolean } };
   zaloMsgIds: string[];

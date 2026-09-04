@@ -12,6 +12,35 @@ export function escapeHtml(text: string): string {
 }
 
 /**
+ * Palette emoji dễ phân biệt, không ZWJ/skin-tone.
+ */
+export const SENDER_EMOJI_PALETTE: readonly string[] = [
+  '🔴', '🟠', '🟡', '🟢', '🔵', '🟣', '🟤', '⚫',
+  '🧡', '💛', '💚', '💙', '💜', '🖤', '🤍', '🤎',
+  '🐶', '🐱', '🐭', '🐹', '🐰', '🦊', '🐻', '🐼',
+  '🐨', '🐯', '🦁', '🐮', '🐷', '🐸', '🐵', '🐔',
+  '🐧', '🐦', '🦆', '🦅', '🦉', '🐝', '🦋', '🐢',
+  '🐙', '🐬', '🐳', '🐘', '🍎', '🍊', '🍋', '🍇',
+  '🍓', '🍒', '🍑', '🍍', '🥑', '🥕', '🌽', '🍄',
+  '🚀', '⛵', '🚲', '⚽', '🎯', '🎨', '🎸', '💎',
+];
+
+/**
+ * Hash ổn định (FNV-1a 32-bit unsigned), map UID thành emoji trong palette.
+ * UID rỗng → fallback '⚪', không throw.
+ */
+export function senderEmoji(uid: string): string {
+  if (!uid) return '⚪';
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < uid.length; i++) {
+    hash ^= uid.charCodeAt(i);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  const idx = (hash >>> 0) % SENDER_EMOJI_PALETTE.length;
+  return SENDER_EMOJI_PALETTE[idx]!;
+}
+
+/**
  * Apply Zalo mention metadata to a plain-text message body, returning an
  * HTML-escaped string with each mention span wrapped in `<b>` tags.
  *
@@ -132,24 +161,27 @@ export function applyZaloMarkupHtml(
 
 /**
  * Format a group message as:
- *   <b>SenderName:</b>
+ *   [Emoji ]<b>SenderName:</b>
  *   content…
  */
-export function formatGroupMsg(senderName: string, content: string): string {
-  return `<b>${escapeHtml(truncate(senderName, 64))}:</b>\n${escapeHtml(truncate(content))}`;
+export function formatGroupMsg(senderName: string, content: string, senderUid?: string): string {
+  const prefix = senderUid ? `${senderEmoji(senderUid)} ` : '';
+  return `${prefix}<b>${escapeHtml(truncate(senderName, 64))}:</b>\n${escapeHtml(truncate(content))}`;
 }
 
 /**
  * Format a group message with pre-escaped HTML body (e.g. when mention spans
  * have already been wrapped in <b> tags).
  */
-export function formatGroupMsgHtml(senderName: string, bodyHtml: string): string {
-  return `<b>${escapeHtml(truncate(senderName, 64))}:</b>\n${bodyHtml}`;
+export function formatGroupMsgHtml(senderName: string, bodyHtml: string, senderUid?: string): string {
+  const prefix = senderUid ? `${senderEmoji(senderUid)} ` : '';
+  return `${prefix}<b>${escapeHtml(truncate(senderName, 64))}:</b>\n${bodyHtml}`;
 }
 
-/** Caption for group media (just bold sender name). */
-export function groupCaption(senderName: string): string {
-  return `<b>${escapeHtml(truncate(senderName, 64))}</b>`;
+/** Caption for group media (just bold sender name, with optional emoji prefix). */
+export function groupCaption(senderName: string, senderUid?: string): string {
+  const prefix = senderUid ? `${senderEmoji(senderUid)} ` : '';
+  return `${prefix}<b>${escapeHtml(truncate(senderName, 64))}</b>`;
 }
 
 /**

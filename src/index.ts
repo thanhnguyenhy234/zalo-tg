@@ -6,6 +6,10 @@ import { setupTelegramHandler, isQrLoginInProgress } from './telegram/handler.js
 import { config } from './config.js';
 import { startUpdateChecker } from './updater.js';
 import { store } from './store.js';
+import { setSenderIconResolver } from './utils/format.js';
+
+// Wire up manual user icon resolver to TopicStore
+setSenderIconResolver((uid) => store.getUserIcon(uid));
 
 // ── Global safety net — prevent unhandled rejections from crashing ────────────
 process.on('unhandledRejection', (reason) => {

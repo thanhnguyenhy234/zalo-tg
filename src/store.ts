@@ -46,6 +46,8 @@ interface StoreData {
   zaloIndex: Record<string, number>;
   /** peer UID → manual DM display name override */
   dmNameOverrides?: Record<string, string>;
+  /** peer UID → manual custom user icon/emoji */
+  userIcons?: Record<string, string>;
   /** topicId (as string key) → pending name prompt metadata */
   pendingNamePrompts?: Record<string, PendingNamePromptEntry>;
   /** topicId (as string key) → tracked khac phuc topics */
@@ -94,6 +96,35 @@ export const store = {
   /** Get the manually confirmed display name for a DM peer, if any. */
   getDmNameOverride(zaloId: string): string | undefined {
     return _data.dmNameOverrides?.[zaloId];
+  },
+
+  /** Get manual custom icon for a Zalo user UID, if any. */
+  getUserIcon(uid: string): string | undefined {
+    return _data.userIcons?.[uid];
+  },
+
+  /** Persist a manual custom icon for a Zalo user UID. */
+  setUserIcon(uid: string, icon: string): void {
+    const cleanIcon = icon.trim();
+    if (!cleanIcon) return;
+    if (!_data.userIcons) _data.userIcons = {};
+    if (_data.userIcons[uid] !== cleanIcon) {
+      _data.userIcons[uid] = cleanIcon;
+      persist(_data);
+    }
+  },
+
+  /** Delete manual custom icon for a Zalo user UID. Returns true if existed and removed. */
+  deleteUserIcon(uid: string): boolean {
+    if (!_data.userIcons?.[uid]) return false;
+    delete _data.userIcons[uid];
+    persist(_data);
+    return true;
+  },
+
+  /** Get all stored manual custom user icons. */
+  getAllUserIcons(): Record<string, string> {
+    return { ...(_data.userIcons ?? {}) };
   },
 
   /** Persist a manual display-name override for a DM peer. */
@@ -210,7 +241,7 @@ export const store = {
     _data = load();
   },
 
-  stats(): { topics: number; sizeBytes: number; pendingPrompts: number; overrides: number; kpTopics: number } {
+  stats(): { topics: number; sizeBytes: number; pendingPrompts: number; overrides: number; kpTopics: number; userIcons: number } {
     const raw = JSON.stringify(_data);
     return {
       topics: Object.keys(_data.topics).length,
@@ -218,6 +249,7 @@ export const store = {
       pendingPrompts: Object.keys(_data.pendingNamePrompts ?? {}).length,
       overrides: Object.keys(_data.dmNameOverrides ?? {}).length,
       kpTopics: Object.keys(_data.kpTopics ?? {}).length,
+      userIcons: Object.keys(_data.userIcons ?? {}).length,
     };
   },
 };

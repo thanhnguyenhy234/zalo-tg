@@ -42,7 +42,7 @@ import { unreadState } from '../unread-state.js';
 import { downloadToTemp, cleanTemp, convertToM4a, extractVideoThumbnail, convertWebmToGif, convertTgsToGif } from '../utils/media.js';
 import { triggerQRLogin } from '../zalo/client.js';
 import { appGetReceivedFriendRequests, appGetSentFriendRequests, appGetGroupInfo, appGetGroupMembersInfo } from '../zalo/appApi.js';
-import { escapeHtml } from '../utils/format.js';
+import { escapeHtml, senderEmoji } from '../utils/format.js';
 
 // Bridge start time (module load = process start)
 const _bridgeStartTime = Date.now();
@@ -1052,6 +1052,212 @@ ${line}`;
       iconUpdated
         ? `🗑️ Đã xoá topic <b>${escapeHtml(removed.name)}</b> khỏi danh sách khắc phục và đổi icon topic.`
         : `🗑️ Đã xoá topic <b>${escapeHtml(removed.name)}</b> khỏi danh sách khắc phục, nhưng chưa đổi được icon topic.`,
+      { ...replyOpts, parse_mode: 'HTML' },
+    );
+  });
+
+  tgBot.command(['set_user_icon', 'set_user_emoji', 'set_icon'], async (ctx) => {
+    if (ctx.chat.id !== config.telegram.groupId) return;
+
+    const topicId = 'message_thread_id' in ctx.message
+      ? (ctx.message.message_thread_id as number | undefined)
+      : undefined;
+    const replyOpts = topicId ? { message_thread_id: topicId } : {};
+
+    const replyTo = 'reply_to_message' in ctx.message
+      ? (ctx.message as { reply_to_message?: { message_id: number } }).reply_to_message
+      : undefined;
+    const quote = replyTo ? msgStore.getQuote(replyTo.message_id) : undefined;
+    const entry = topicId ? store.getEntryByTopic(topicId) : undefined;
+
+    const rawText = 'text' in ctx.message ? (ctx.message.text ?? '') : '';
+    const rawArgs = rawText
+      .replace(/^\/(?:set_user_icon|set_user_emoji|set_icon)(?:@[A-Za-z0-9_]+)?\s*/i, '')
+      .trim();
+    const parts = rawArgs ? rawArgs.split(/\s+/) : [];
+
+    const isClearWord = (s: string) => ['clear', 'reset', 'remove', 'none', 'del', 'delete'].includes(s.toLowerCase());
+
+    const getUserDisplayName = (uid: string): string => {
+      return (
+        userCache.getName(uid) ||
+        aliasCache.get(uid) ||
+        (entry?.type === 0 && entry.zaloId === uid ? entry.name : undefined) ||
+        uid
+      );
+    };
+
+    // Case a: List custom icons
+    if (parts.length === 1 && parts[0]!.toLowerCase() === 'list') {
+      const allIcons = store.getAllUserIcons();
+      const entries = Object.entries(allIcons);
+      if (entries.length === 0) {
+        await ctx.telegram.sendMessage(
+          config.telegram.groupId,
+          'ℹ️ Chưa có icon tuỳ chỉnh nào được lưu.',
+          { ...replyOpts, parse_mode: 'HTML' },
+        );
+        return;
+      }
+      const lines = [
+        '📋 <b>Danh sách user icon tuỳ chỉnh:</b>',
+        '━━━━━━━━━━━━━━━━',
+        ...entries.map(([uid, icon]) => {
+          const name = getUserDisplayName(uid);
+          return `• <code>${uid}</code>: ${icon} (<b>${escapeHtml(name)}</b>)`;
+        }),
+      ];
+      await ctx.telegram.sendMessage(
+        config.telegram.groupId,
+        lines.join('\n'),
+        { ...replyOpts, parse_mode: 'HTML' },
+      );
+      return;
+    }
+
+    // Determine target UID and action
+    const contextUid = quote?.uidFrom || (entry?.type === 0 ? entry.zaloId : undefined);
+
+    // Case f: No args -> Show current icon or usage guide
+    if (parts.length === 0) {
+      if (contextUid) {
+        const currentCustom = store.getUserIcon(contextUid);
+        const activeEmoji = senderEmoji(contextUid);
+        const name = getUserDisplayName(contextUid);
+        const text = [
+          `👤 User: <b>${escapeHtml(name)}</b> (<code>${contextUid}</code>)`,
+          `🎨 Icon hiện tại: ${activeEmoji} ${currentCustom ? '<i>(tuỳ chỉnh)</i>' : '<i>(mặc định)</i>'}`,
+          '',
+          '💡 <b>Cách đổi:</b> <code>/set_user_icon &lt;icon&gt;</code>',
+          '💡 <b>Cách xoá:</b> <code>/set_user_icon clear</code>',
+        ].join('\n');
+        await ctx.telegram.sendMessage(
+          config.telegram.groupId,
+          text,
+          { ...replyOpts, parse_mode: 'HTML' },
+        );
+        return;
+      }
+
+      // No context -> Help guide
+      const helpText = [
+        '📖 <b>Hướng dẫn đặt icon user Zalo:</b>',
+        '━━━━━━━━━━━━━━━━',
+        '• <b>Đổi icon qua reply:</b> Reply tin nhắn Zalo + <code>/set_user_icon 👑</code>',
+        '• <b>Đổi icon trong topic DM:</b> <code>/set_user_icon 🌸</code>',
+        '• <b>Đổi icon theo UID:</b> <code>/set_user_icon &lt;uid&gt; &lt;icon&gt;</code>',
+        '• <b>Xoá icon tuỳ chỉnh:</b> <code>/set_user_icon clear</code> hoặc <code>/set_user_icon &lt;uid&gt; clear</code>',
+        '• <b>Xem icon hiện tại:</b> <code>/set_user_icon</code> (khi reply hoặc trong DM)',
+        '• <b>Xem danh sách:</b> <code>/set_user_icon list</code>',
+      ].join('\n');
+      await ctx.telegram.sendMessage(
+        config.telegram.groupId,
+        helpText,
+        { ...replyOpts, parse_mode: 'HTML' },
+      );
+      return;
+    }
+
+    // Case e: Reset / Clear
+    if (parts.length === 1 && isClearWord(parts[0]!)) {
+      if (!contextUid) {
+        await ctx.telegram.sendMessage(
+          config.telegram.groupId,
+          '⚠️ Hãy reply tin nhắn Zalo, dùng trong topic DM, hoặc chỉ định UID: <code>/set_user_icon &lt;uid&gt; clear</code>',
+          { ...replyOpts, parse_mode: 'HTML' },
+        );
+        return;
+      }
+      const deleted = store.deleteUserIcon(contextUid);
+      const name = getUserDisplayName(contextUid);
+      const defaultEmoji = senderEmoji(contextUid);
+      const msg = deleted
+        ? `✅ Đã xoá icon tuỳ chỉnh của <b>${escapeHtml(name)}</b> (<code>${contextUid}</code>).\nTrở về icon mặc định: ${defaultEmoji}`
+        : `ℹ️ User <b>${escapeHtml(name)}</b> (<code>${contextUid}</code>) chưa có icon tuỳ chỉnh nào. (Mặc định: ${defaultEmoji})`;
+      await ctx.telegram.sendMessage(
+        config.telegram.groupId,
+        msg,
+        { ...replyOpts, parse_mode: 'HTML' },
+      );
+      return;
+    }
+
+    if (parts.length >= 2 && isClearWord(parts[1]!)) {
+      const targetUid = parts[0]!;
+      const deleted = store.deleteUserIcon(targetUid);
+      const name = getUserDisplayName(targetUid);
+      const defaultEmoji = senderEmoji(targetUid);
+      const msg = deleted
+        ? `✅ Đã xoá icon tuỳ chỉnh của <b>${escapeHtml(name)}</b> (<code>${targetUid}</code>).\nTrở về icon mặc định: ${defaultEmoji}`
+        : `ℹ️ User <b>${escapeHtml(name)}</b> (<code>${targetUid}</code>) chưa có icon tuỳ chỉnh nào. (Mặc định: ${defaultEmoji})`;
+      await ctx.telegram.sendMessage(
+        config.telegram.groupId,
+        msg,
+        { ...replyOpts, parse_mode: 'HTML' },
+      );
+      return;
+    }
+
+    // Setting icon
+    if (parts.length === 1) {
+      if (!contextUid) {
+        if (/^\d{5,}$/.test(parts[0]!)) {
+          const targetUid = parts[0]!;
+          const currentCustom = store.getUserIcon(targetUid);
+          const activeEmoji = senderEmoji(targetUid);
+          const name = getUserDisplayName(targetUid);
+          const text = [
+            `👤 User: <b>${escapeHtml(name)}</b> (<code>${targetUid}</code>)`,
+            `🎨 Icon hiện tại: ${activeEmoji} ${currentCustom ? '<i>(tuỳ chỉnh)</i>' : '<i>(mặc định)</i>'}`,
+            '',
+            `💡 <b>Cách đổi:</b> <code>/set_user_icon ${targetUid} &lt;icon&gt;</code>`,
+            `💡 <b>Cách xoá:</b> <code>/set_user_icon ${targetUid} clear</code>`,
+          ].join('\n');
+          await ctx.telegram.sendMessage(
+            config.telegram.groupId,
+            text,
+            { ...replyOpts, parse_mode: 'HTML' },
+          );
+          return;
+        }
+
+        await ctx.telegram.sendMessage(
+          config.telegram.groupId,
+          '⚠️ Vui lòng reply tin nhắn Zalo, dùng trong topic DM, hoặc chỉ định UID: <code>/set_user_icon &lt;uid&gt; &lt;icon&gt;</code>',
+          { ...replyOpts, parse_mode: 'HTML' },
+        );
+        return;
+      }
+
+      const icon = parts[0]!.trim();
+      store.setUserIcon(contextUid, icon);
+      const name = getUserDisplayName(contextUid);
+      await ctx.telegram.sendMessage(
+        config.telegram.groupId,
+        `✅ Đã đặt icon cho <b>${escapeHtml(name)}</b> (<code>${contextUid}</code>): ${icon}`,
+        { ...replyOpts, parse_mode: 'HTML' },
+      );
+      return;
+    }
+
+    let targetUid: string;
+    let icon: string;
+    if (/^\d{5,}$/.test(parts[0]!)) {
+      targetUid = parts[0]!;
+      icon = parts.slice(1).join(' ').trim();
+    } else if (contextUid) {
+      targetUid = contextUid;
+      icon = parts.join(' ').trim();
+    } else {
+      targetUid = parts[0]!;
+      icon = parts.slice(1).join(' ').trim();
+    }
+
+    store.setUserIcon(targetUid, icon);
+    const name = getUserDisplayName(targetUid);
+    await ctx.telegram.sendMessage(
+      config.telegram.groupId,
+      `✅ Đã đặt icon cho <b>${escapeHtml(name)}</b> (<code>${targetUid}</code>): ${icon}`,
       { ...replyOpts, parse_mode: 'HTML' },
     );
   });

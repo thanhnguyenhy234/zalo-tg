@@ -25,12 +25,24 @@ export const SENDER_EMOJI_PALETTE: readonly string[] = [
   '🚀', '⛵', '🚲', '⚽', '🎯', '🎨', '🎸', '💎',
 ];
 
+export type SenderIconResolver = (uid: string) => string | undefined;
+
+let _senderIconResolver: SenderIconResolver | null = null;
+
+export function setSenderIconResolver(resolver: SenderIconResolver | null): void {
+  _senderIconResolver = resolver;
+}
+
 /**
  * Hash ổn định (FNV-1a 32-bit unsigned), map UID thành emoji trong palette.
+ * Nếu có custom resolver và trả về icon hợp lệ (chuỗi không rỗng), ưu tiên dùng icon này.
  * UID rỗng → fallback '⚪', không throw.
  */
 export function senderEmoji(uid: string): string {
   if (!uid) return '⚪';
+  const custom = _senderIconResolver?.(uid)?.trim();
+  if (custom) return custom;
+
   let hash = 0x811c9dc5;
   for (let i = 0; i < uid.length; i++) {
     hash ^= uid.charCodeAt(i);

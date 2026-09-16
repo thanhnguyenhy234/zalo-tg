@@ -29,6 +29,8 @@ const BOT_COMMANDS = [
   { command: 'friendrequests', description: 'Xem & duyệt lời mời kết bạn đang chờ' },
   { command: 'joingroup',      description: 'Tham gia nhóm Zalo qua link mời' },
   { command: 'leavegroup',     description: 'Rời nhóm Zalo của topic hiện tại' },
+  { command: 'send_contact',   description: 'Gửi danh bạ Zalo từ file TOML cấu hình' },
+  { command: 'add_contact',    description: 'Thêm hoặc cập nhật liên hệ danh bạ' },
   { command: 'status',         description: 'Xem trạng thái kết nối & thống kê bridge' },
 ];
 

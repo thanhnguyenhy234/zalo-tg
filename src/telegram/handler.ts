@@ -65,7 +65,7 @@ import {
 	saveOrUpdateContact,
 	type ContactEntry,
 } from "../utils/contacts.js";
-import { escapeHtml, senderEmoji } from "../utils/format.js";
+import { escapeHtml, senderEmoji, topicName } from "../utils/format.js";
 import {
 	cleanTemp,
 	convertTgsToGif,
@@ -367,12 +367,37 @@ async function applyManualDmDisplayName(
 
 	try {
 		await tgBot.telegram.editForumTopic(config.telegram.groupId, topicId, {
-			name: `👤 ${cleanName}`.slice(0, 128),
+			name: topicName(cleanName, 0),
 		});
 		return true;
 	} catch (err) {
 		console.warn(
 			`[TG→Zalo] Failed to rename DM topic ${topicId} for ${zaloId}:`,
+			err,
+		);
+		return false;
+	}
+}
+
+async function applyManualGroupDisplayName(
+	topicId: number,
+	groupId: string,
+	requestedName: string,
+): Promise<boolean> {
+	const cleanName = normalizeManualDisplayName(requestedName);
+	if (!cleanName) return false;
+	if (cleanName === groupId || cleanName === `Zalo ${groupId}`) return false;
+
+	store.updateName(topicId, cleanName);
+
+	try {
+		await tgBot.telegram.editForumTopic(config.telegram.groupId, topicId, {
+			name: topicName(cleanName, 1),
+		});
+		return true;
+	} catch (err) {
+		console.warn(
+			`[TG→Zalo] Failed to rename group topic ${topicId} for ${groupId}:`,
 			err,
 		);
 		return false;
@@ -1503,15 +1528,6 @@ ${line}`;
 			return;
 		}
 
-		if (entry.type !== 0) {
-			await ctx.telegram.sendMessage(
-				config.telegram.groupId,
-				"⚠️ /set_topic_name hiện chỉ áp dụng cho topic DM.",
-				replyOpts,
-			);
-			return;
-		}
-
 		const requestedName = normalizeManualDisplayName(
 			(ctx.message.text ?? "").replace(
 				/^\/set_topic_name(?:@[A-Za-z0-9_]+)?\s*/i,
@@ -1527,12 +1543,23 @@ ${line}`;
 			return;
 		}
 
-		const applied = await applyManualDmDisplayName(
-			topicId,
-			entry.zaloId,
-			requestedName,
-		);
-		pendingNamePromptStore.clearPendingNamePrompt(topicId);
+		const applied =
+			entry.type === 1
+				? await applyManualGroupDisplayName(
+						topicId,
+						entry.zaloId,
+						requestedName,
+				  )
+				: await applyManualDmDisplayName(
+						topicId,
+						entry.zaloId,
+						requestedName,
+				  );
+
+		if (entry.type === 0) {
+			pendingNamePromptStore.clearPendingNamePrompt(topicId);
+		}
+
 		await ctx.telegram.sendMessage(
 			config.telegram.groupId,
 			applied

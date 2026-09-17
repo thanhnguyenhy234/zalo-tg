@@ -46,4 +46,21 @@ assert.equal(typeof stats.userIcons, 'number', 'stats.userIcons must be a number
 // Clean up
 store.deleteUserIcon(testUid);
 
+// 9. Test store.updateName for DM (type: 0) and Group (type: 1)
+const testDmTopicId = 888801;
+const testDmZaloId = 'test_dm_user_888';
+store.set({ topicId: testDmTopicId, zaloId: testDmZaloId, type: 0, name: 'Old DM Name' });
+store.setDmNameOverride(testDmZaloId, 'New DM Name');
+assert.equal(store.getDmNameOverride(testDmZaloId), 'New DM Name');
+assert.equal(store.getEntryByTopic(testDmTopicId)?.name, 'New DM Name');
+store.remove(testDmTopicId);
+
+const testGroupTopicId = 888802;
+const testGroupZaloId = 'test_group_888';
+store.set({ topicId: testGroupTopicId, zaloId: testGroupZaloId, type: 1, name: 'Old Group Name' });
+store.updateName(testGroupTopicId, 'New Group Name');
+assert.equal(store.getEntryByTopic(testGroupTopicId)?.name, 'New Group Name');
+assert.equal(store.getDmNameOverride(testGroupZaloId), undefined, 'Group rename must not set dmNameOverrides');
+store.remove(testGroupTopicId);
+
 console.log('All store tests passed successfully!');

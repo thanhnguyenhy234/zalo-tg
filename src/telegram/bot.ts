@@ -16,7 +16,7 @@ const BOT_COMMANDS = [
   { command: 'message_search', description: 'Tìm nội dung trong tin đã sync gần đây' },
   { command: 'recall',         description: 'Thu hồi tin nhắn đã gửi sang Zalo' },
   { command: 'topic',          description: 'Quản lý topic: list | info | delete' },
-  { command: 'set_topic_name', description: 'Đổi tên topic DM hiện tại ngay lập tức' },
+  { command: 'set_topic_name', description: 'Đổi tên topic hiện tại ngay lập tức' },
   { command: 'set_user_icon',  description: 'Đặt icon/emoji thủ công cho user Zalo' },
   { command: 'add_kp',         description: 'Thêm topic hiện tại vào danh sách khắc phục' },
   { command: 'list_kp',        description: 'Liệt kê toàn bộ topic khắc phục đã lưu' },
